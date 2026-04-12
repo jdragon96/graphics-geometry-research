@@ -1,0 +1,8 @@
+build/
+*.spv
+*.o
+*.a
+*.dylib
+.DS_Store
+.claude
+imgui.ini
