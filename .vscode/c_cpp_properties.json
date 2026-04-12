@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "name": "Mac",
+            "compilerPath": "/usr/bin/clang++",
+            "intelliSenseMode": "macos-clang-arm64",
+            "cppStandard": "c++17",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/Users/sjy/VulkanSDK/1.4.328.1/macOS/include",
+                "/opt/homebrew/opt/glfw/include",
+                "/opt/homebrew/opt/eigen/include/eigen3",
+                "${workspaceFolder}/build/_deps/imgui-src",
+                "${workspaceFolder}/build/_deps/imgui-src/backends"
+            ]
+        }
+    ],
+    "version": 4
+}

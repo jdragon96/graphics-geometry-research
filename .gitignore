@@ -22,3 +22,6 @@ build/
 imgui.ini
 .DS_Store
 .claude
+
+*/.cache
+**/.cache/

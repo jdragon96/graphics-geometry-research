@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(Vision3D)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 set(VULKAN_SDK  "$ENV{HOME}/VulkanSDK/1.4.328.1/macOS")
