@@ -31,6 +31,9 @@ public:
     // 앱 시작 시 Vulkan 리소스 초기화
     virtual void onInit(const VulkanContext& ctx) = 0;
 
+    // 렌더 패스 시작 전 컴퓨트 커맨드 기록 (optional)
+    virtual void onCompute(VkCommandBuffer cmd) {}
+
     // 매 프레임 Vulkan 렌더링
     virtual void onRender(const RenderContext& ctx) = 0;
 

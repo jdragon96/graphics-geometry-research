@@ -41,6 +41,9 @@ set(SHADERS
     ${SHADER_DIR}/triangle.frag
     ${SHADER_DIR}/blinnphong.vert
     ${SHADER_DIR}/blinnphong.frag
+    ${SHADER_DIR}/compute_wave.comp
+    ${SHADER_DIR}/cube_wave.vert
+    ${SHADER_DIR}/cube_wave.frag
 )
 
 foreach(SHADER ${SHADERS})
@@ -85,6 +88,7 @@ add_executable(vision3d
     SceneObject.cpp
     Feature/TriangleFeature.cpp
     Feature/BlinnPhongFeature.cpp
+    Feature/ComputeTest.cpp
     ${IMGUI_SOURCES}
 )
 target_include_directories(vision3d PRIVATE ${COMMON_INCLUDES})

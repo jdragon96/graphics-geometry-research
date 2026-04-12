@@ -452,6 +452,10 @@ void Application::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) 
     rp.clearValueCount = 1;
     rp.pClearValues    = &clear;
 
+    // 렌더 패스 전: 컴퓨트 디스패치 (컴퓨트 피처만 실행)
+    if (activeFeature_ < (int)features_.size())
+        features_[activeFeature_]->onCompute(cmd);
+
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
     RenderContext rc{ cmd, imageIndex };
