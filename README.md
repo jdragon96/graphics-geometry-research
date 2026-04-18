@@ -3,11 +3,11 @@
 ## 1. 사용 방법
 
 ```bash
-# 빌드
 cmake --build build
-
-# 실행
 ./build/Vision3D
+
+cmake --build build --target vision3d_test
+./build/vision3d_test
 ```
 
 ## 2. 어플리케이션 구조
