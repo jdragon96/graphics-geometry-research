@@ -11,7 +11,9 @@
                 "/opt/homebrew/opt/glfw/include",
                 "/opt/homebrew/opt/eigen/include/eigen3",
                 "${workspaceFolder}/build/_deps/imgui-src",
-                "${workspaceFolder}/build/_deps/imgui-src/backends"
+                "${workspaceFolder}/build/_deps/imgui-src/backends",
+                "/opt/homebrew/opt/openvdb/include",
+                "/opt/homebrew/opt/tbb/include"
             ]
         }
     ],

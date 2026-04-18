@@ -9,8 +9,17 @@ set(VULKAN_SDK  "$ENV{HOME}/VulkanSDK/1.4.328.1/macOS")
 set(GLFW_DIR    "/opt/homebrew/opt/glfw")
 set(EIGEN_DIR   "/opt/homebrew/opt/eigen/include/eigen3")
 
-find_library(VULKAN_LIB vulkan PATHS ${VULKAN_SDK}/lib REQUIRED)
-find_library(GLFW_LIB   glfw   PATHS ${GLFW_DIR}/lib   REQUIRED)
+# ── OpenVDB (brew install openvdb) ────────────────────────────────────────────
+set(OPENVDB_ROOT /opt/homebrew/opt/openvdb)
+set(TBB_ROOT     /opt/homebrew/opt/tbb)
+
+find_path  (OPENVDB_INCLUDE openvdb/openvdb.h PATHS ${OPENVDB_ROOT}/include REQUIRED)
+find_library(OPENVDB_LIB   openvdb           PATHS ${OPENVDB_ROOT}/lib      REQUIRED)
+find_library(TBB_LIB       tbb               PATHS ${TBB_ROOT}/lib          REQUIRED)
+
+find_library(VULKAN_LIB  vulkan           PATHS ${VULKAN_SDK}/lib REQUIRED)
+find_library(GLFW_LIB    glfw             PATHS ${GLFW_DIR}/lib   REQUIRED)
+find_library(SHADERC_LIB shaderc_combined PATHS ${VULKAN_SDK}/lib REQUIRED)
 
 # ── ImGui (FetchContent) ──────────────────────────────────────────────────────
 include(FetchContent)
@@ -45,6 +54,8 @@ set(SHADERS
     ${SHADER_DIR}/compute_wave.comp
     ${SHADER_DIR}/cube_wave.vert
     ${SHADER_DIR}/cube_wave.frag
+    ${SHADER_DIR}/tsdf_voxel.vert
+    ${SHADER_DIR}/tsdf_voxel.frag
 )
 
 foreach(SHADER ${SHADERS})
@@ -68,9 +79,11 @@ set(COMMON_INCLUDES
     ${EIGEN_DIR}
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
+    ${OPENVDB_INCLUDE}
+    ${TBB_ROOT}/include
 )
-set(COMMON_LIBS ${VULKAN_LIB} ${GLFW_LIB})
-set(COMMON_RPATH "${VULKAN_SDK}/lib;${GLFW_DIR}/lib")
+set(COMMON_LIBS ${VULKAN_LIB} ${GLFW_LIB} ${OPENVDB_LIB} ${TBB_LIB} ${SHADERC_LIB})
+set(COMMON_RPATH "${VULKAN_SDK}/lib;${GLFW_DIR}/lib;${OPENVDB_ROOT}/lib;${TBB_ROOT}/lib")
 
 # ── Target 1: vulkan_triangle (main.cpp 보존용) ───────────────────────────────
 # add_executable(vulkan_triangle
@@ -90,9 +103,22 @@ add_executable(vision3d
     Feature/TriangleFeature.cpp
     Feature/BlinnPhongFeature.cpp
     Feature/ComputeTest.cpp
+    Feature/TSDF.cpp
     ${IMGUI_SOURCES}
 )
 target_include_directories(vision3d PRIVATE ${COMMON_INCLUDES})
 target_link_libraries(vision3d PRIVATE ${COMMON_LIBS})
 set_target_properties(vision3d PROPERTIES BUILD_RPATH "${COMMON_RPATH}")
 add_dependencies(vision3d shaders)
+
+# ── Target 3: vision3d_test (Problem Runner) ──────────────────────────────────
+add_executable(vision3d_test
+    main_forTest.cpp
+    Problem/ApplicationForTest.cpp
+    SceneObject.cpp
+    ${IMGUI_SOURCES}
+)
+target_include_directories(vision3d_test PRIVATE ${COMMON_INCLUDES} ${CMAKE_SOURCE_DIR})
+target_link_libraries(vision3d_test PRIVATE ${COMMON_LIBS})
+set_target_properties(vision3d_test PROPERTIES BUILD_RPATH "${COMMON_RPATH}")
+add_dependencies(vision3d_test shaders)

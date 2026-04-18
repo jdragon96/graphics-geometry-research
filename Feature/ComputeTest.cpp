@@ -139,6 +139,12 @@ void ComputeTest::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
 
 void ComputeTest::createCubeGeometry()
 {
+    /*
+    1. Geometry data 생성
+    2. Vertex의 Geometry 정보에 대한 DeviceBuffer 및 Memory 생성
+    3. Vertex의 Index 정보에 대한 Device Buffer 및 Memory 생성
+    */
+
     constexpr float h = 0.5f;
     const std::vector<CubeVertex> verts = {
         // Front  (z=+h, n=0,0,1)
@@ -182,20 +188,26 @@ void ComputeTest::createCubeGeometry()
     cubeIndexCount_ = (uint32_t)idxs.size();
 
     VkDeviceSize vs = sizeof(CubeVertex) * verts.size();
-    createBuffer(vs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    createBuffer(vs,
+                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  cubeVertexBuffer_, cubeVertexMemory_);
-    void *d;
-    vkMapMemory(ctx_.device, cubeVertexMemory_, 0, vs, 0, &d);
-    memcpy(d, verts.data(), vs);
+    void *h_vertexDataBuffer;
+    // device, vertex_device_memory, offset, size, flag, vertex_host_memory
+    vkMapMemory(ctx_.device, cubeVertexMemory_, 0, vs, 0, &h_vertexDataBuffer);
+    memcpy(h_vertexDataBuffer, verts.data(), vs);
     vkUnmapMemory(ctx_.device, cubeVertexMemory_);
 
     VkDeviceSize is = sizeof(uint32_t) * idxs.size();
-    createBuffer(is, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    createBuffer(is,
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  cubeIndexBuffer_, cubeIndexMemory_);
-    vkMapMemory(ctx_.device, cubeIndexMemory_, 0, is, 0, &d);
-    memcpy(d, idxs.data(), is);
+    void *h_vertexIndexBuffer;
+    vkMapMemory(ctx_.device, cubeIndexMemory_, 0, is, 0, &h_vertexIndexBuffer);
+    memcpy(h_vertexIndexBuffer, idxs.data(), is);
     vkUnmapMemory(ctx_.device, cubeIndexMemory_);
 }
 
@@ -203,18 +215,62 @@ void ComputeTest::createCubeGeometry()
 
 void ComputeTest::createSSBO()
 {
+    /*
+    - SSBO는 Compute shader 활용 후, 그 결과를 Vertex Buffer로 사용하기 때문
+    - SSBO Computing -> GPU to CPU -> Vertex Buffer Copy 과정 없이, GPU에서 바로 사용
+    */
     // Particle = { vec4 position, vec4 color } = 32 bytes per particle
     VkDeviceSize size = (VkDeviceSize)(gridSize_ * gridSize_) * 32;
     createBuffer(size,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 ssboBuffer_, ssboMemory_);
+                 ssboBuffer_,
+                 ssboMemory_);
 }
 
 // ── 컴퓨트 파이프라인 ─────────────────────────────────────────────────────────
 
 void ComputeTest::createComputePipeline()
 {
+    /**
+     * VkDescriptorSetLayoutBinding
+     * VkDescriptorSetLayoutCreateInfo
+     * VkDescriptorPoolSize
+     * VkDescriptorPoolCreateInfo
+     * VkDescriptorSetAllocateInfo
+     * VkDescriptorBufferInfo
+     * VkWriteDescriptorSet
+     * VkPushConstantRangefVkPushConstantRange
+     * VkPipelineLayoutCreateInfo
+     * VkPipelineShaderStageCreateInfo
+     * - Shader 코드
+     * - Shader Entry point
+     * VkComputePipelineCreateInfo
+     * - Layout 등록
+     * - Shader Stage 등록
+     *
+     *
+     * Compute Pipeline을 GPU에 등록하는 과정입니다. 크게 4단계로 나뉩니다.
+     *
+        1단계 — Descriptor Set Layout + Pool + Set 생성
+        "compute shader가 어떤 리소스를 어떻게 쓸지" GPU에 선언하는 과정입니다.
+
+        Layout  → "binding 0번에 SSBO 하나 씀"
+        Pool    → Descriptor Set을 할당할 메모리 공간 예약
+        Set     → Pool에서 실제 Descriptor Set 하나 할당
+        Update  → Set의 binding 0번에 ssboBuffer_ 연결
+        2단계 — Push Constants 선언
+        매 프레임 바뀌는 작은 데이터(시간, 파라미터 등)를 descriptor 없이 직접 shader에 밀어넣기 위한 범위 선언입니다.
+
+        3단계 — Pipeline Layout 생성
+        Descriptor Set Layout + Push Constants를 묶어서 "이 pipeline은 이런 인터페이스를 가진다" 라고 Vulkan에 등록합니다.
+
+        4단계 — Compute Pipeline 생성
+        .spv 파일을 로드해서 shader module을 만들고, layout과 함께 묶어 실제 실행 가능한 compute pipeline을 생성합니다. 이후 shader module은 pipeline에 이미 복사됐으므로 즉시 destroy합니다.
+
+        요약하면: "SSBO를 읽고 쓸 수 있는 compute shader pipeline을 GPU에 완전히 등록" 하는 초기화 함수입니다.
+     */
+
     // Descriptor set layout: binding 0 = SSBO
     VkDescriptorSetLayoutBinding binding{};
     binding.binding = 0;
@@ -318,7 +374,6 @@ void ComputeTest::updateUBO()
     ubo.cubeScale = cubeScale_;
     memcpy(uboMapped_, &ubo, sizeof(ubo));
 }
-
 // ── 그래픽스 파이프라인 ───────────────────────────────────────────────────────
 void ComputeTest::createGraphicsPipeline()
 {
