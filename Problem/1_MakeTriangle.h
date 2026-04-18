@@ -134,11 +134,12 @@ void main() {
         vi.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrDesc.size());
         vi.pVertexAttributeDescriptions = attrDesc.data();
 
-        // TODO (A): Triangle을 그리기 위한 topology 값을 설정하세요.
-        //   힌트: VK_PRIMITIVE_TOPOLOGY_??? 중 세 정점으로 삼각형을 만드는 값은?
         VkPipelineInputAssemblyStateCreateInfo ia{};
         ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; // TODO: Triangle을 그리는 올바른 값으로 교체하세요
+        // TODO (A): Triangle을 그리기 위한 topology 값을 설정하세요.
+        // TODO: Triangle을 그리는 올바른 값으로 교체하세요
+        //   힌트: VK_PRIMITIVE_TOPOLOGY_??? 중 세 정점으로 삼각형을 만드는 값은?
+        // ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
         VkViewport viewport{0.f, 0.f, (float)ctx_.extent.width, (float)ctx_.extent.height, 0.f, 1.f};
         VkRect2D scissor{{0, 0}, ctx_.extent};
@@ -217,5 +218,42 @@ void main() {
         //
         // Step 6. vkMapMemory() → memcpy(vertices_.data()) → vkUnmapMemory()
         //         순서로 정점 데이터를 GPU 메모리에 업로드하세요.
+
+        // TODO: Triangle에 대한 메모리 계산(byte)
+        uint32_t uiBufferSize = 0;
+
+        VkBufferCreateInfo kBufferInfo;
+        // TODO: kBufferInfo.sType =
+        // TODO: kBufferInfo.size =
+        kBufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        kBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(ctx_.device, &kBufferInfo, nullptr, &vertexBuffer_) != VK_SUCCESS)
+            throw std::runtime_error("failed to create vertex buffer");
+
+        // Step 2: 메모리 요구사항 조회
+        // - Vulkan에서는 VkBuffer 인스턴스가 있으면 메모리를 얼마나 잡아먹는지 체크해주는 API가 있음
+        // - VkMemoryRequirements
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(ctx_.device, vertexBuffer_, &req);
+
+        // Step 3 & 4: 메모리 타입 선택 후 할당
+        VkMemoryAllocateInfo ai{};
+        // TODO: ai.sType =
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = findMemoryType(
+            ctx_.physicalDevice,
+            req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (vkAllocateMemory(ctx_.device, &ai, nullptr, &vertexMemory_) != VK_SUCCESS)
+            throw std::runtime_error("failed to allocate vertex memory");
+
+        // Step 5: 바인딩
+        vkBindBufferMemory(ctx_.device, vertexBuffer_, vertexMemory_, 0);
+
+        // Step 6: 데이터 업로드
+        void *data;
+        vkMapMemory(ctx_.device, vertexMemory_, 0, uiBufferSize, 0, &data);
+        memcpy(data, vertices_.data(), uiBufferSize);
+        vkUnmapMemory(ctx_.device, vertexMemory_);
     }
 };
