@@ -104,6 +104,7 @@ add_executable(vision3d
     Feature/BlinnPhongFeature.cpp
     Feature/ComputeTest.cpp
     Feature/TSDF.cpp
+    Feature/BucketedHash.cpp
     ${IMGUI_SOURCES}
 )
 target_include_directories(vision3d PRIVATE ${COMMON_INCLUDES})

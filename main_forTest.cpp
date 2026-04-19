@@ -6,6 +6,8 @@
 
 #include "Problem/1_MakeTriangle.h"
 #include "Problem/1_MakeTriangle_Solv.h"
+#include "Problem/2_UsingIndexBuffer.h"
+#include "Problem/2_UsingIndexBufferSolv.h"
 
 #include <iostream>
 
@@ -18,6 +20,8 @@ int main()
         // ── 문제 / 정답 Feature 등록 ──────────────────────────────────────────
         app.addFeature(std::make_unique<MakeTriangle>());
         app.addFeature(std::make_unique<MakeTriangleSolv>());
+        app.addFeature(std::make_unique<UsingIndexBuffer>());
+        app.addFeature(std::make_unique<UsingIndexBufferSolv>());
 
         app.run();
     }
