@@ -4,10 +4,10 @@
 // 풀고 싶은 문제를 include하고 아래 addFeature()에 등록하세요.
 // 정답을 확인하려면 1_MakeTriangle_Solv.h 를 함께 include하세요.
 
-#include "Problem/1_MakeTriangle.h"
 #include "Problem/1_MakeTriangle_Solv.h"
-#include "Problem/2_UsingIndexBuffer.h"
 #include "Problem/2_UsingIndexBufferSolv.h"
+#include "Problem/3_RotateTriangleSolv.h"
+#include "Problem/4_MakeCubeSolv.h"
 
 #include <iostream>
 
@@ -18,10 +18,10 @@ int main()
         Application app(1280, 720, "Vision3D - Problem Runner");
 
         // ── 문제 / 정답 Feature 등록 ──────────────────────────────────────────
-        app.addFeature(std::make_unique<MakeTriangle>());
         app.addFeature(std::make_unique<MakeTriangleSolv>());
-        app.addFeature(std::make_unique<UsingIndexBuffer>());
         app.addFeature(std::make_unique<UsingIndexBufferSolv>());
+        app.addFeature(std::make_unique<RotateTriangleSolv>());
+        app.addFeature(std::make_unique<MakeCubeSolv>());
 
         app.run();
     }

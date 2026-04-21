@@ -543,21 +543,29 @@ void Application::drawFrame()
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    // Feature 선택 패널
+    // Feature 선택 패널 — 세로 스크롤 목록
+    ImGui::SetNextWindowSize(ImVec2(220, 0), ImGuiCond_FirstUseEver);
     ImGui::Begin("Features");
+
+    // 하단 힌트 텍스트 한 줄 높이를 남기고 나머지를 스크롤 영역으로 사용
+    float childH = ImGui::GetContentRegionAvail().y
+                   - ImGui::GetFrameHeightWithSpacing();
+    ImGui::BeginChild("FeatureList", ImVec2(0, childH), false);
     for (int i = 0; i < (int)features_.size(); i++)
     {
         bool active = (i == activeFeature_);
         if (active)
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.f));
-        if (ImGui::Button(features_[i]->name()))
+        // -FLT_MIN: 현재 창 너비에 맞게 버튼 가득 채움
+        if (ImGui::Button(features_[i]->name(), ImVec2(-FLT_MIN, 0)))
             activeFeature_ = i;
         if (active)
             ImGui::PopStyleColor();
-        if (i + 1 < (int)features_.size())
-            ImGui::SameLine();
     }
-    ImGui::Text("1~9: switch feature  |  ESC: quit");
+    ImGui::EndChild();
+
+    ImGui::Separator();
+    ImGui::TextDisabled("1~9: switch  |  ESC: quit");
     ImGui::End();
 
     if (activeFeature_ < (int)features_.size())

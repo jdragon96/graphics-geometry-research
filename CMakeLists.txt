@@ -105,6 +105,7 @@ add_executable(vision3d
     Feature/ComputeTest.cpp
     Feature/TSDF.cpp
     Feature/BucketedHash.cpp
+    Feature/VoxelHash.cpp
     ${IMGUI_SOURCES}
 )
 target_include_directories(vision3d PRIVATE ${COMMON_INCLUDES})

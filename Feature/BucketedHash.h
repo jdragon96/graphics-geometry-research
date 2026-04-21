@@ -4,6 +4,7 @@
 #include "../Utilities.h"
 #include <vulkan/vulkan.h>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <vector>
 #include <chrono>
 

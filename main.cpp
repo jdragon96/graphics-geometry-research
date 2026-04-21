@@ -4,6 +4,7 @@
 #include "Feature/ComputeTest.h"
 #include "Feature/TSDF.h"
 #include "Feature/BucketedHash.h"
+#include "Feature/VoxelHash.h"
 
 int main()
 {
@@ -13,6 +14,7 @@ int main()
     app.addFeature(std::make_unique<ComputeTest>());
     app.addFeature(std::make_unique<TSDFFeature>());
     app.addFeature(std::make_unique<BucketedHash>());
+    app.addFeature(std::make_unique<VoxelHashFeature>());
     app.run();
     return 0;
 }

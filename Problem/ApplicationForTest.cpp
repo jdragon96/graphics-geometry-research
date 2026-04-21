@@ -1,4 +1,5 @@
 #include "ApplicationForTest.h"
+#include "../Utilities.h"
 
 #include <mach-o/dyld.h>
 #include <filesystem>
@@ -90,11 +91,50 @@ void Application::initVulkan()
     createLogicalDevice();
     createSwapchain();
     createImageViews();
+    createDepthResources();
     createRenderPass();
     createFramebuffers();
     createCommandPool();
     createCommandBuffers();
     createSyncObjects();
+}
+
+void Application::createDepthResources()
+{
+    constexpr VkFormat kDepthFmt = VK_FORMAT_D32_SFLOAT;
+
+    VkImageCreateInfo ici{};
+    ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType     = VK_IMAGE_TYPE_2D;
+    ici.format        = kDepthFmt;
+    ici.extent        = {swapchainExtent_.width, swapchainExtent_.height, 1};
+    ici.mipLevels     = 1;
+    ici.arrayLayers   = 1;
+    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage         = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (vkCreateImage(device_, &ici, nullptr, &depthImage_) != VK_SUCCESS)
+        throw std::runtime_error("failed to create depth image");
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device_, depthImage_, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize  = req.size;
+    ai.memoryTypeIndex = findMemoryType(physicalDevice_, req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &ai, nullptr, &depthMemory_) != VK_SUCCESS)
+        throw std::runtime_error("failed to allocate depth memory");
+    vkBindImageMemory(device_, depthImage_, depthMemory_, 0);
+
+    VkImageViewCreateInfo vci{};
+    vci.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image            = depthImage_;
+    vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format           = kDepthFmt;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &vci, nullptr, &depthView_) != VK_SUCCESS)
+        throw std::runtime_error("failed to create depth image view");
 }
 
 void Application::createInstance()
@@ -338,39 +378,55 @@ void Application::createImageViews()
 
 void Application::createRenderPass()
 {
-    VkAttachmentDescription att{};
-    att.format = swapchainFormat_;
-    att.samples = VK_SAMPLE_COUNT_1_BIT;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentDescription colorAtt{};
+    colorAtt.format         = swapchainFormat_;
+    colorAtt.samples        = VK_SAMPLE_COUNT_1_BIT;
+    colorAtt.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAtt.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAtt.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAtt.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAtt.finalLayout    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentDescription depthAtt{};
+    depthAtt.format         = VK_FORMAT_D32_SFLOAT;
+    depthAtt.samples        = VK_SAMPLE_COUNT_1_BIT;
+    depthAtt.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAtt.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAtt.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAtt.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAtt.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
 
     VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &ref;
+    subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount    = 1;
+    subpass.pColorAttachments       = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency dep{};
-    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass    = 0;
+    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     dep.srcAccessMask = 0;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
+    VkAttachmentDescription atts[] = {colorAtt, depthAtt};
     VkRenderPassCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    ci.attachmentCount = 1;
-    ci.pAttachments = &att;
-    ci.subpassCount = 1;
-    ci.pSubpasses = &subpass;
+    ci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    ci.attachmentCount = 2;
+    ci.pAttachments    = atts;
+    ci.subpassCount    = 1;
+    ci.pSubpasses      = &subpass;
     ci.dependencyCount = 1;
-    ci.pDependencies = &dep;
+    ci.pDependencies   = &dep;
 
     if (vkCreateRenderPass(device_, &ci, nullptr, &renderPass_) != VK_SUCCESS)
         throw std::runtime_error("failed to create render pass");
@@ -381,14 +437,15 @@ void Application::createFramebuffers()
     framebuffers_.resize(swapchainViews_.size());
     for (size_t i = 0; i < swapchainViews_.size(); i++)
     {
+        VkImageView atts[] = {swapchainViews_[i], depthView_};
         VkFramebufferCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        ci.renderPass = renderPass_;
-        ci.attachmentCount = 1;
-        ci.pAttachments = &swapchainViews_[i];
-        ci.width = swapchainExtent_.width;
-        ci.height = swapchainExtent_.height;
-        ci.layers = 1;
+        ci.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        ci.renderPass      = renderPass_;
+        ci.attachmentCount = 2;
+        ci.pAttachments    = atts;
+        ci.width           = swapchainExtent_.width;
+        ci.height          = swapchainExtent_.height;
+        ci.layers          = 1;
         if (vkCreateFramebuffer(device_, &ci, nullptr, &framebuffers_[i]) != VK_SUCCESS)
             throw std::runtime_error("failed to create framebuffer");
     }
@@ -512,14 +569,20 @@ void Application::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex)
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin);
 
-    VkClearValue clear = {{{0.1f, 0.1f, 0.1f, 1.0f}}};
+    VkClearValue clears[2] = {};
+    clears[0].color.float32[0] = 0.1f;
+    clears[0].color.float32[1] = 0.1f;
+    clears[0].color.float32[2] = 0.1f;
+    clears[0].color.float32[3] = 1.0f;
+    clears[1].depthStencil.depth   = 1.0f;
+    clears[1].depthStencil.stencil = 0;
     VkRenderPassBeginInfo rp{};
-    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp.renderPass = renderPass_;
-    rp.framebuffer = framebuffers_[imageIndex];
-    rp.renderArea = {{0, 0}, swapchainExtent_};
-    rp.clearValueCount = 1;
-    rp.pClearValues = &clear;
+    rp.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass      = renderPass_;
+    rp.framebuffer     = framebuffers_[imageIndex];
+    rp.renderArea      = {{0, 0}, swapchainExtent_};
+    rp.clearValueCount = 2;
+    rp.pClearValues    = clears;
 
     // 렌더 패스 전: 컴퓨트 디스패치 (컴퓨트 피처만 실행)
     if (activeFeature_ < (int)features_.size())
@@ -544,20 +607,23 @@ void Application::drawFrame()
     ImGui::NewFrame();
 
     // Feature 선택 패널
+    ImGui::SetNextWindowSize(ImVec2(220, 0), ImGuiCond_FirstUseEver);
     ImGui::Begin("Features");
+    float childH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing();
+    ImGui::BeginChild("FeatureList", ImVec2(0, childH), false);
     for (int i = 0; i < (int)features_.size(); i++)
     {
         bool active = (i == activeFeature_);
         if (active)
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.f));
-        if (ImGui::Button(features_[i]->name()))
+        if (ImGui::Button(features_[i]->name(), ImVec2(-FLT_MIN, 0)))
             activeFeature_ = i;
         if (active)
             ImGui::PopStyleColor();
-        if (i + 1 < (int)features_.size())
-            ImGui::SameLine();
     }
-    ImGui::Text("1~9: switch feature  |  ESC: quit");
+    ImGui::EndChild();
+    ImGui::Separator();
+    ImGui::TextDisabled("1~9: switch  |  ESC: quit");
     ImGui::End();
 
     if (activeFeature_ < (int)features_.size())
