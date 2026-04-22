@@ -5,6 +5,7 @@
 #include "Feature/TSDF.h"
 #include "Feature/BucketedHash.h"
 #include "Feature/VoxelHash.h"
+#include "Feature/RecoveredPointCloud.h"
 
 int main()
 {
@@ -14,7 +15,10 @@ int main()
     app.addFeature(std::make_unique<ComputeTest>());
     app.addFeature(std::make_unique<TSDFFeature>());
     app.addFeature(std::make_unique<BucketedHash>());
-    app.addFeature(std::make_unique<VoxelHashFeature>());
+    auto voxelHash = std::make_unique<VoxelHashFeature>();
+    VoxelHashFeature* voxelHashPtr = voxelHash.get();
+    app.addFeature(std::move(voxelHash));
+    app.addFeature(std::make_unique<RecoveredPointCloudFeature>(voxelHashPtr));
     app.run();
     return 0;
 }

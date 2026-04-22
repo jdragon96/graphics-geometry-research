@@ -106,6 +106,7 @@ add_executable(vision3d
     Feature/TSDF.cpp
     Feature/BucketedHash.cpp
     Feature/VoxelHash.cpp
+    Feature/RecoveredPointCloud.cpp
     ${IMGUI_SOURCES}
 )
 target_include_directories(vision3d PRIVATE ${COMMON_INCLUDES})

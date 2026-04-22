@@ -4,6 +4,11 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
+#include <vector>
+#include <array>
+#include <numeric>
+#include <unordered_map>
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GLSL 공통 매크로 (모든 compute shader 가 include)
@@ -126,132 +131,176 @@ void main() {
 )GLSL";
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Shader 2: Insert
-//    · 각 입력 점을 해시 슬롯에 CAS 로 배치
-//    · TSDF = dot(voxelCenter - point, surfaceNormal) / truncation
-//    · float-CAS 로 acc_tsdf, acc_w 누산
-//    · acc_color, acc_norm 은 last-write-wins
+//  Shader 2: GatherInsert  (논문 방식 — float-CAS 완전 제거)
+//
+//  설계 원칙 (vs 기존 scatter + float-CAS)
+//    · CPU 에서 점을 버킷 해시 기준으로 정렬 + cellStart/cellEnd 구축
+//    · 1 workgroup = 1 버킷 (32 threads 협력)
+//    · Phase1: 슬롯 키 로드
+//    · Phase2: thread 0 이 슬롯 할당 (같은 버킷 = 동일 workgroup → 원자 불필요)
+//    · Phase3: 32 스레드 협력 gather → 스레드 별 레지스터 누산 (원자 없음)
+//    · Phase4: tree reduction (shared memory)
+//    · Phase5: thread t → slot t 단독 write (경쟁 없음)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr const char *kVH_InsertComp = R"GLSL(
+static constexpr const char *kVH_GatherComp = R"GLSL(
 #version 450
-layout(local_size_x = 64) in;
+layout(local_size_x = 32) in;
+
 layout(push_constant) uniform PC {
-    float    sensorX, sensorY, sensorZ;
-    float    voxelSize;
-    uint     numPoints;
-    uint     numBuckets;
-    float    truncation;
-    float    maxWeight;
+    float sensorX, sensorY, sensorZ;
+    float voxelSize;
+    uint  _numPts;
+    uint  _numBuckets;
+    float truncation;
+    float _maxW;
 } pc;
-)GLSL"
-                                              // kVH_Common を続けて埋め込む
-                                              R"GLSL(
+
 #define STRIDE      12
 #define F_KX         0
 #define F_KY         1
 #define F_KZ         2
-#define F_TSDF       3
-#define F_W          4
-#define F_COL        5
-#define F_NORM       6
 #define F_ACCT       7
 #define F_ACCW       8
 #define F_ACCC       9
 #define F_ACCN      10
-#define F_FTAG      11
-#define EMPTY       0x7FFFFFFF
-#define BUCKET_SIZE 4
+#define EMPTY        0x7FFFFFFF
+#define BUCKET_SIZE  4
 
 layout(set=0, binding=0) buffer HT  { int raw[]; } ht;
 layout(set=0, binding=1) readonly buffer Pts { vec4 pts[]; };
 layout(set=0, binding=2) buffer Ctr { uint n; } ctr;
+layout(set=0, binding=3) readonly buffer CS { uint d[]; } cellStart;
+layout(set=0, binding=4) readonly buffer CE { uint d[]; } cellEnd;
 
-void casAddF(int idx, float val) {
-    int expected, next;
-    for (int i = 0; i < 64; i++) {
-        expected = ht.raw[idx];
-        next     = floatBitsToInt(intBitsToFloat(expected) + val);
-        if (atomicCompSwap(ht.raw[idx], expected, next) == expected) return;
-    }
-}
-uint hash3(ivec3 k, uint nb) {
-    return (uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u) % nb;
-}
-uint packNormal(vec3 n) {
-    float l1 = abs(n.x)+abs(n.y)+abs(n.z);
-    n /= max(l1,1e-6);
+shared int   sKX[BUCKET_SIZE];
+shared int   sKY[BUCKET_SIZE];
+shared int   sKZ[BUCKET_SIZE];
+shared float sScrT[32];
+shared float sScrW[32];
+shared float sFT[BUCKET_SIZE];
+shared float sFW[BUCKET_SIZE];
+shared int   sFC[BUCKET_SIZE];
+shared int   sFN[BUCKET_SIZE];
+
+uint packNorm(vec3 n) {
+    float l = abs(n.x)+abs(n.y)+abs(n.z);
+    n /= max(l, 1e-6);
     if (n.z < 0.0) {
-        float sx = n.x>=0.0?1.0:-1.0, sy = n.y>=0.0?1.0:-1.0;
-        n.xy = (1.0 - abs(n.yx)) * vec2(sx,sy);
+        vec2 s = vec2(n.x>=0.0?1.0:-1.0, n.y>=0.0?1.0:-1.0);
+        n.xy = (1.0-abs(n.yx))*s;
     }
-    uint nx = uint(clamp(n.x*0.5+0.5,0.0,1.0)*65535.0);
-    uint ny = uint(clamp(n.y*0.5+0.5,0.0,1.0)*65535.0);
-    return (nx & 0xFFFFu) | ((ny & 0xFFFFu)<<16u);
+    return (uint(clamp(n.x*.5+.5,0.,1.)*65535.)&0xFFFFu)
+          |((uint(clamp(n.y*.5+.5,0.,1.)*65535.)&0xFFFFu)<<16u);
 }
-uint posToColor(ivec3 k) {
-    uint h = uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u;
-    float t = float(h & 0xFFFFu)/65535.0;
-    float r = clamp(abs(fract(t+0.000)*6.0-3.0)-1.0,0.0,1.0);
-    float g = clamp(abs(fract(t+0.333)*6.0-3.0)-1.0,0.0,1.0);
-    float b = clamp(abs(fract(t+0.667)*6.0-3.0)-1.0,0.0,1.0);
-    return uint(r*255.0)|(uint(g*255.0)<<8u)|(uint(b*255.0)<<16u)|0xFF000000u;
-}
-
-void accumulate(uint slot, float tsdf, float w, uint col, uint norm) {
-    uint base = slot * uint(STRIDE);
-    casAddF(int(base + F_ACCT), tsdf * w);
-    casAddF(int(base + F_ACCW), w);
-    atomicExchange(ht.raw[int(base + F_ACCC)], int(col));
-    atomicExchange(ht.raw[int(base + F_ACCN)], int(norm));
+uint posCol(ivec3 k) {
+    uint h = uint(k.x)*73856093u^uint(k.y)*19349663u^uint(k.z)*83492791u;
+    float t = float(h&0xFFFFu)/65535.;
+    return uint(clamp(abs(fract(t      )*6.-3.)-1.,0.,1.)*255.)
+          |(uint(clamp(abs(fract(t+.333)*6.-3.)-1.,0.,1.)*255.)<<8u)
+          |(uint(clamp(abs(fract(t+.667)*6.-3.)-1.,0.,1.)*255.)<<16u)
+          |0xFF000000u;
 }
 
 void main() {
-    uint tid = gl_GlobalInvocationID.x;
-    if (tid >= pc.numPoints) return;
+    uint bucket = gl_WorkGroupID.x;
+    uint tid    = gl_LocalInvocationID.x;
 
-    vec3  pt     = pts[tid].xyz;
-    vec3  sensor = vec3(pc.sensorX, pc.sensorY, pc.sensorZ);
-    ivec3 key    = ivec3(floor(pt / pc.voxelSize));
-    uint  base   = hash3(key, pc.numBuckets) * uint(BUCKET_SIZE);
+    // ── Phase 1: 기존 슬롯 키 로드 ───────────────────────────────────────────
+    if (tid < uint(BUCKET_SIZE)) {
+        int gb = int((bucket * uint(BUCKET_SIZE) + tid) * uint(STRIDE));
+        sKX[tid] = ht.raw[gb + F_KX];
+        sKY[tid] = ht.raw[gb + F_KY];
+        sKZ[tid] = ht.raw[gb + F_KZ];
+        sFT[tid] = 0.0; sFW[tid] = 0.0; sFC[tid] = 0; sFN[tid] = 0;
+    }
+    barrier();
 
-    // ── TSDF 계산 ─────────────────────────────────────────────────────────────
-    // 센서 방향이 표면 법선의 최선 근사
-    vec3  surfNorm  = normalize(sensor - pt);
-    vec3  voxCentre = (vec3(key) + 0.5) * pc.voxelSize;
-    // 복셀 중심에서 실제 표면까지의 부호 있는 거리 (법선 방향 투영)
-    float tsdf      = dot(voxCentre - pt, surfNorm) / pc.truncation;
-    tsdf = clamp(tsdf, -1.0, 1.0);
+    uint pStart = cellStart.d[bucket];
+    uint pEnd   = cellEnd.d[bucket];
+    if (pStart >= pEnd) return;  // 이 버킷에 점 없음 → early exit
 
-    // 관측 신뢰도: 센서와 표면이 수직에 가까울수록 높음
-    float w = max(dot(surfNorm, normalize(sensor - voxCentre)), 0.05);
-
-    uint packedNorm  = packNormal(surfNorm);
-    uint packedColor = posToColor(key);
-
-    // ── CAS 슬롯 탐색 + 누산 ──────────────────────────────────────────────────
-    for (int s = 0; s < BUCKET_SIZE; s++) {
-        uint slot = base + uint(s);
-        int  b    = int(slot * uint(STRIDE));
-
-        // 이미 이 복셀로 할당된 슬롯 → 누산만
-        if (ht.raw[b+F_KX] == key.x &&
-            ht.raw[b+F_KY] == key.y &&
-            ht.raw[b+F_KZ] == key.z) {
-            accumulate(slot, tsdf, w, packedColor, packedNorm);
-            return;
-        }
-
-        // 빈 슬롯 CAS 점유
-        int prev = atomicCompSwap(ht.raw[b+F_KX], EMPTY, key.x);
-        if (prev == EMPTY) {
-            ht.raw[b+F_KY] = key.y;
-            ht.raw[b+F_KZ] = key.z;
-            accumulate(slot, tsdf, w, packedColor, packedNorm);
-            return;
+    // ── Phase 2: thread 0 이 슬롯 할당 (workgroup 단독 소유 → 원자 불필요) ───
+    if (tid == 0u) {
+        for (uint i = pStart; i < pEnd; i++) {
+            ivec3 key = ivec3(floor(pts[i].xyz / pc.voxelSize));
+            bool found = false;
+            for (int s = 0; s < BUCKET_SIZE; s++) {
+                if (sKX[s]==key.x && sKY[s]==key.y && sKZ[s]==key.z) { found=true; break; }
+            }
+            if (!found) {
+                for (int s = 0; s < BUCKET_SIZE; s++) {
+                    if (sKX[s] == EMPTY) {
+                        int gb = int((bucket*uint(BUCKET_SIZE)+uint(s))*uint(STRIDE));
+                        ht.raw[gb+0] = key.x;
+                        ht.raw[gb+1] = key.y;
+                        ht.raw[gb+2] = key.z;
+                        sKX[s]=key.x; sKY[s]=key.y; sKZ[s]=key.z;
+                        break;
+                    }
+                }
+            }
         }
     }
-    // 버킷 포화 — 이 점 드롭 (정상적인 해시 부하에서는 드묾)
+    barrier();
+
+    // ── Phase 3: 32 thread 협력 gather — 스레드 별 레지스터 누산 (원자 없음) ─
+    vec3  sensor = vec3(pc.sensorX, pc.sensorY, pc.sensorZ);
+    float myT[4]; float myW[4]; int myC[4]; int myN[4];
+    myT[0]=myT[1]=myT[2]=myT[3]=0.0;
+    myW[0]=myW[1]=myW[2]=myW[3]=0.0;
+    myC[0]=myC[1]=myC[2]=myC[3]=0;
+    myN[0]=myN[1]=myN[2]=myN[3]=0;
+
+    for (uint i = pStart + tid; i < pEnd; i += 32u) {
+        vec3  pt  = pts[i].xyz;
+        ivec3 key = ivec3(floor(pt / pc.voxelSize));
+        int s = -1;
+        if      (sKX[0]==key.x&&sKY[0]==key.y&&sKZ[0]==key.z) s=0;
+        else if (sKX[1]==key.x&&sKY[1]==key.y&&sKZ[1]==key.z) s=1;
+        else if (sKX[2]==key.x&&sKY[2]==key.y&&sKZ[2]==key.z) s=2;
+        else if (sKX[3]==key.x&&sKY[3]==key.y&&sKZ[3]==key.z) s=3;
+        if (s < 0) continue;
+
+        vec3  sn   = normalize(sensor - pt);
+        vec3  vc   = (vec3(key)+0.5)*pc.voxelSize;
+        float tsdf = clamp(dot(vc-pt, sn)/pc.truncation, -1.0, 1.0);
+        float w    = max(dot(sn, normalize(sensor-vc)), 0.05);
+        myT[s] += tsdf*w; myW[s] += w;
+        myC[s]  = int(posCol(key)); myN[s] = int(packNorm(sn));
+    }
+
+    // ── Phase 4: 슬롯별 tree reduction (shared memory) ───────────────────────
+#define REDUCE_SLOT(S) \
+    sScrT[tid]=myT[S]; sScrW[tid]=myW[S]; barrier(); \
+    if(tid<16u){sScrT[tid]+=sScrT[tid+16u];sScrW[tid]+=sScrW[tid+16u];} barrier(); \
+    if(tid< 8u){sScrT[tid]+=sScrT[tid+ 8u];sScrW[tid]+=sScrW[tid+ 8u];} barrier(); \
+    if(tid< 4u){sScrT[tid]+=sScrT[tid+ 4u];sScrW[tid]+=sScrW[tid+ 4u];} barrier(); \
+    if(tid< 2u){sScrT[tid]+=sScrT[tid+ 2u];sScrW[tid]+=sScrW[tid+ 2u];} barrier(); \
+    if(tid< 1u){sScrT[0]+=sScrT[1];sScrW[0]+=sScrW[1];} barrier(); \
+    if(tid==0u){sFT[S]=sScrT[0];sFW[S]=sScrW[0];}
+
+    REDUCE_SLOT(0)
+    REDUCE_SLOT(1)
+    REDUCE_SLOT(2)
+    REDUCE_SLOT(3)
+
+    // 색상/법선: thread 0의 마지막 관측값 사용
+    if (tid == 0u) {
+        for (int s = 0; s < BUCKET_SIZE; s++) {
+            if (myC[s] != 0) { sFC[s]=myC[s]; sFN[s]=myN[s]; }
+        }
+    }
+    barrier();
+
+    // ── Phase 5: 원자 없는 write-back (thread t → slot t, 경쟁 없음) ─────────
+    if (tid < uint(BUCKET_SIZE) && sFW[tid] > 0.0 && sKX[tid] != EMPTY) {
+        int gb = int((bucket*uint(BUCKET_SIZE)+tid)*uint(STRIDE));
+        ht.raw[gb + F_ACCT] = floatBitsToInt(sFT[tid]);
+        ht.raw[gb + F_ACCW] = floatBitsToInt(sFW[tid]);
+        ht.raw[gb + F_ACCC] = sFC[tid];
+        ht.raw[gb + F_ACCN] = sFN[tid];
+    }
 }
 )GLSL";
 
@@ -358,11 +407,11 @@ void main() {
 static constexpr const char *kVH_RenderVert = R"GLSL(
 #version 450
 layout(push_constant) uniform PC {
-    mat4     mvp;
-    float    voxelSize;
-    uint     colorMode;
-    uint     currentFrame;
-    uint     highlightFrames;
+    mat4  mvp;
+    float voxelSize;
+    uint  colorMode;
+    uint  currentFrame;
+    uint  highlightFrames;
 } pc;
 
 layout(set=0, binding=0) readonly buffer HT { int raw[]; } ht;
@@ -379,10 +428,37 @@ layout(location = 1) out float fragHighlight;
 #define F_FTAG  11
 #define EMPTY   0x7FFFFFFF
 
+// ── 큐브 기하 테이블 ─────────────────────────────────────────────────────────
+// 8 꼭짓점 (단위 큐브, 중심=원점)
+const vec3 kC[8] = vec3[8](
+    vec3(-0.5,-0.5,-0.5), vec3( 0.5,-0.5,-0.5),
+    vec3( 0.5, 0.5,-0.5), vec3(-0.5, 0.5,-0.5),
+    vec3(-0.5,-0.5, 0.5), vec3( 0.5,-0.5, 0.5),
+    vec3( 0.5, 0.5, 0.5), vec3(-0.5, 0.5, 0.5)
+);
+
+// 6면 × 2삼각형 × 3꼭짓점 = 36 인덱스
+// 면 순서: -Z, +Z, -Y, +Y, -X, +X  (각 6개)
+const int kI[36] = int[36](
+    0,2,1, 0,3,2,   // -Z
+    4,5,6, 4,6,7,   // +Z
+    0,1,5, 0,5,4,   // -Y
+    3,7,6, 3,6,2,   // +Y
+    0,4,7, 0,7,3,   // -X
+    1,2,6, 1,6,5    // +X
+);
+
+// 면 법선 (Lambert 음영용)
+const vec3 kN[6] = vec3[6](
+    vec3( 0, 0,-1), vec3( 0, 0, 1),
+    vec3( 0,-1, 0), vec3( 0, 1, 0),
+    vec3(-1, 0, 0), vec3( 1, 0, 0)
+);
+
 vec3 unpackNormal(uint packed) {
     float fx = float(packed & 0xFFFFu)/65535.0*2.0-1.0;
     float fy = float((packed>>16u)&0xFFFFu)/65535.0*2.0-1.0;
-    vec3 n = vec3(fx, fy, 1.0 - abs(fx) - abs(fy));
+    vec3 n = vec3(fx, fy, 1.0-abs(fx)-abs(fy));
     if (n.z < 0.0) {
         float ox = n.x>=0.0?(1.0-abs(n.y)):-(1.0-abs(n.y));
         float oy = n.y>=0.0?(1.0-abs(n.x)):-(1.0-abs(n.x));
@@ -390,19 +466,19 @@ vec3 unpackNormal(uint packed) {
     }
     return normalize(n);
 }
-
 vec3 tsdfColor(float t) {
-    if (t < 0.0) return mix(vec3(0.0,0.0,1.0), vec3(1.0,1.0,1.0), t + 1.0);
-    else          return mix(vec3(1.0,1.0,1.0), vec3(1.0,0.0,0.0), t);
+    return t < 0.0 ? mix(vec3(0,0,1),vec3(1,1,1),t+1.0)
+                   : mix(vec3(1,1,1),vec3(1,0,0),t);
 }
 
 void main() {
-    int b = gl_VertexIndex * STRIDE;
-    int kx = ht.raw[b + F_KX];
+    int voxelIdx = gl_VertexIndex / 36;
+    int triIdx   = gl_VertexIndex % 36;
+    int b        = voxelIdx * STRIDE;
+    int kx       = ht.raw[b + F_KX];
 
     if (kx == EMPTY) {
         gl_Position   = vec4(10.0, 10.0, 10.0, 1.0);
-        gl_PointSize  = 0.0;
         fragColor     = vec3(0.0);
         fragHighlight = 0.0;
         return;
@@ -412,41 +488,43 @@ void main() {
     int kz = ht.raw[b+2];
     vec3 centre = (vec3(float(kx), float(ky), float(kz)) + 0.5) * pc.voxelSize;
 
-    // ── Integration 플래시 계산 (PointSize에도 영향) ──────────────────────────
-    int   frameTag  = ht.raw[b + F_FTAG];
-    float age       = float(int(pc.currentFrame) - frameTag);
+    // ── Integration 플래시 ────────────────────────────────────────────────────
+    int   frameTag   = ht.raw[b + F_FTAG];
+    float age        = float(int(pc.currentFrame) - frameTag);
     float highlightT = (frameTag >= 0)
         ? max(0.0, 1.0 - age / float(pc.highlightFrames))
         : 0.0;
 
-    gl_Position  = pc.mvp * vec4(centre, 1.0);
-    // 최근 갱신 복셀일수록 크게 표시 (2px → 8px)
-    gl_PointSize = mix(2.0, 8.0, highlightT);
+    // 기본 크기 0.92 (복셀 간 틈), 최근 업데이트 시 1.08로 팽창
+    float scale   = mix(0.92, 1.08, highlightT);
+    vec3 localPos = kC[kI[triIdx]] * pc.voxelSize * scale;
+    gl_Position   = pc.mvp * vec4(centre + localPos, 1.0);
 
-    // ── 기본 색상 (colorMode) ─────────────────────────────────────────────────
+    // ── 기본 색상 ─────────────────────────────────────────────────────────────
     vec3 base;
     if (pc.colorMode == 0u) {
         uint col = uint(ht.raw[b + F_COL]);
-        base = vec3(float(col & 0xFFu), float((col>>8u)&0xFFu), float((col>>16u)&0xFFu)) / 255.0;
+        base = vec3(float(col&0xFFu), float((col>>8u)&0xFFu), float((col>>16u)&0xFFu))/255.0;
     } else if (pc.colorMode == 1u) {
-        uint norm = uint(ht.raw[b + F_NORM]);
-        vec3 n = unpackNormal(norm);
-        base = n * 0.5 + 0.5;
+        base = unpackNormal(uint(ht.raw[b + F_NORM])) * 0.5 + 0.5;
     } else if (pc.colorMode == 2u) {
-        float t = intBitsToFloat(ht.raw[b + F_TSDF]);
-        base = tsdfColor(t);
+        base = tsdfColor(intBitsToFloat(ht.raw[b + F_TSDF]));
     } else if (pc.colorMode == 3u) {
         float w = clamp(intBitsToFloat(ht.raw[b + F_W]) / 50.0, 0.0, 1.0);
         base = vec3(w);
     } else {
-        // colorMode 4: 업데이트 최신도 히트맵 (빨강=최근, 파랑=오래됨, 회색=미관측)
         if (frameTag < 0) {
             base = vec3(0.15);
         } else {
             float normAge = clamp(age / float(max(pc.highlightFrames * 4u, 1u)), 0.0, 1.0);
-            base = mix(vec3(1.0, 0.2, 0.0), vec3(0.0, 0.3, 1.0), normAge);
+            base = mix(vec3(1.0,0.2,0.0), vec3(0.0,0.3,1.0), normAge);
         }
     }
+
+    // ── Lambert 면 음영 ───────────────────────────────────────────────────────
+    vec3  lightDir = normalize(vec3(1.0, 2.0, 1.5));
+    float diffuse  = max(dot(kN[triIdx / 6], lightDir), 0.0);
+    base *= 0.35 + 0.65 * diffuse;
 
     // 황색 플래시 오버레이
     fragColor     = mix(base, vec3(1.0, 0.9, 0.1), highlightT * 0.85);
@@ -540,13 +618,12 @@ static float gaussRand()
 
 uint32_t VoxelHashFeature::genSphereBatch()
 {
+    cpuPts_.clear();
+    cpuPts_.reserve(VH_BATCH_SIZE);
+
     float cx = std::cos(sensorEl_), sx = std::sin(sensorEl_);
     float cy = std::cos(sensorAz_), sy = std::sin(sensorAz_);
     Eigen::Vector3f spos(sensorDist_ * cx * sy, sensorDist_ * sx, sensorDist_ * cx * cy);
-
-    void *mapped;
-    vkMapMemory(ctx_.device, ptMem_, 0, VK_WHOLE_SIZE, 0, &mapped);
-    auto *dst = static_cast<float *>(mapped);
 
     uint32_t written = 0;
     while (written < VH_BATCH_SIZE)
@@ -562,14 +639,252 @@ uint32_t VoxelHashFeature::genSphereBatch()
             continue;
 
         p += n * (gaussRand() * noiseStddev_);
-        dst[written * 4 + 0] = p.x();
-        dst[written * 4 + 1] = p.y();
-        dst[written * 4 + 2] = p.z();
-        dst[written * 4 + 3] = 1.f;
+        cpuPts_.push_back(VH_Point{p.x(), p.y(), p.z(), 1.f});
         written++;
     }
-    vkUnmapMemory(ctx_.device, ptMem_);
     return written;
+}
+
+uint32_t VoxelHashFeature::hashBucket(int32_t kx, int32_t ky, int32_t kz)
+{
+    uint32_t h = static_cast<uint32_t>(kx) * 73856093u ^ static_cast<uint32_t>(ky) * 19349663u ^ static_cast<uint32_t>(kz) * 83492791u;
+    return h % VH_NUM_BUCKETS;
+}
+
+uint32_t VoxelHashFeature::packDebugColor(int32_t kx, int32_t ky, int32_t kz)
+{
+    uint32_t h = static_cast<uint32_t>(kx) * 73856093u ^ static_cast<uint32_t>(ky) * 19349663u ^ static_cast<uint32_t>(kz) * 83492791u;
+    float t = static_cast<float>(h & 0xFFFFu) / 65535.0f;
+    auto channel = [](float x) -> uint32_t
+    {
+        float v = std::clamp(std::abs(std::fmod(x, 1.0f) * 6.0f - 3.0f) - 1.0f, 0.0f, 1.0f);
+        return static_cast<uint32_t>(v * 255.0f);
+    };
+    uint32_t r = channel(t + 0.000f);
+    uint32_t g = channel(t + 0.333f);
+    uint32_t b = channel(t + 0.667f);
+    return r | (g << 8u) | (b << 16u) | 0xFF000000u;
+}
+
+void VoxelHashFeature::updateRecoveryStorage(const Eigen::Vector3f &sensorPos)
+{
+    if (cpuPts_.empty())
+        return;
+
+    const uint32_t thisFrame = frameIndex_;
+    for (const VH_Point &p : cpuPts_)
+    {
+        Eigen::Vector3f pos(p.x, p.y, p.z);
+        Eigen::Vector3f normal = (sensorPos - pos).normalized();
+        int32_t kx = static_cast<int32_t>(std::floor(p.x / voxelSize_));
+        int32_t ky = static_cast<int32_t>(std::floor(p.y / voxelSize_));
+        int32_t kz = static_cast<int32_t>(std::floor(p.z / voxelSize_));
+        recoveryRecent_.push_back(VH_RecentSample{pos, normal, packDebugColor(kx, ky, kz), thisFrame});
+    }
+
+    if (static_cast<int>(recoveryRecent_.size()) > recoveryMaxRecentPoints_)
+    {
+        const size_t drop = recoveryRecent_.size() - static_cast<size_t>(recoveryMaxRecentPoints_);
+        recoveryRecent_.erase(recoveryRecent_.begin(), recoveryRecent_.begin() + static_cast<std::ptrdiff_t>(drop));
+    }
+
+    std::unordered_map<int64_t, size_t> mapIdx;
+    std::vector<VH_RecentSample> kept;
+    kept.reserve(recoveryRecent_.size());
+
+    auto keyOf = [](int32_t x, int32_t y, int32_t z) -> int64_t
+    {
+        constexpr int64_t ox = 1ll << 20;
+        constexpr int64_t oy = 1ll << 20;
+        constexpr int64_t oz = 1ll << 20;
+        int64_t ux = static_cast<int64_t>(x) + ox;
+        int64_t uy = static_cast<int64_t>(y) + oy;
+        int64_t uz = static_cast<int64_t>(z) + oz;
+        return (ux << 42) ^ (uy << 21) ^ uz;
+    };
+
+    for (size_t i = 0; i < recoveryCompressed_.size(); ++i)
+        mapIdx[keyOf(recoveryCompressed_[i].keyX, recoveryCompressed_[i].keyY, recoveryCompressed_[i].keyZ)] = i;
+
+    for (const VH_RecentSample &s : recoveryRecent_)
+    {
+        if (thisFrame >= s.frame && (thisFrame - s.frame) > static_cast<uint32_t>(recoveryRecentKeepFrames_))
+        {
+            int32_t kx = static_cast<int32_t>(std::floor(s.pos.x() / voxelSize_));
+            int32_t ky = static_cast<int32_t>(std::floor(s.pos.y() / voxelSize_));
+            int32_t kz = static_cast<int32_t>(std::floor(s.pos.z() / voxelSize_));
+            int64_t key = keyOf(kx, ky, kz);
+            auto it = mapIdx.find(key);
+            if (it == mapIdx.end())
+            {
+                VH_CompressedPoint cp;
+                cp.centroid = s.pos;
+                cp.avgNormal = s.normal;
+                cp.confidence = 1.0f;
+                cp.lastFrame = s.frame;
+                cp.keyX = kx;
+                cp.keyY = ky;
+                cp.keyZ = kz;
+                recoveryCompressed_.push_back(cp);
+                mapIdx[key] = recoveryCompressed_.size() - 1;
+            }
+            else
+            {
+                VH_CompressedPoint &cp = recoveryCompressed_[it->second];
+                const float newW = cp.confidence * recoveryCompressWeightDecay_ + 1.0f;
+                cp.centroid = (cp.centroid * (newW - 1.0f) + s.pos) / newW;
+                cp.avgNormal = (cp.avgNormal * (newW - 1.0f) + s.normal).normalized();
+                cp.confidence = std::min(newW, 512.0f);
+                cp.lastFrame = std::max(cp.lastFrame, s.frame);
+            }
+        }
+        else
+        {
+            kept.push_back(s);
+        }
+    }
+
+    recoveryRecent_.swap(kept);
+}
+
+std::vector<VH_RecentSample> VoxelHashFeature::snapshotRecentSamples() const
+{
+    return recoveryRecent_;
+}
+
+std::vector<VH_CompressedPoint> VoxelHashFeature::snapshotCompressedPoints() const
+{
+    return recoveryCompressed_;
+}
+
+void VoxelHashFeature::buildSpatialHashRanges()
+{
+    struct BucketRun
+    {
+        uint32_t bucket = 0;
+        uint32_t begin = 0;
+        uint32_t end = 0;
+        uint32_t count = 0;
+        uint32_t kept = 0;
+    };
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1) Prepare working arrays and per-frame stats.
+    const uint32_t n = static_cast<uint32_t>(cpuPts_.size());
+    sortedIndex_.resize(n);
+    std::iota(sortedIndex_.begin(), sortedIndex_.end(), 0u);
+    cellStart_.assign(VH_NUM_BUCKETS, 0u);
+    cellEnd_.assign(VH_NUM_BUCKETS, 0u);
+    droppedPoints_ = 0;
+    maxPtsInBucket_ = 0;
+    avgPtsInActiveBucket_ = 0.f;
+
+    // Map original point index -> hash bucket.
+    auto bucketOf = [&](uint32_t idx) -> uint32_t
+    {
+        const VH_Point &p = cpuPts_[idx];
+        int32_t kx = static_cast<int32_t>(std::floor(p.x / voxelSize_));
+        int32_t ky = static_cast<int32_t>(std::floor(p.y / voxelSize_));
+        int32_t kz = static_cast<int32_t>(std::floor(p.z / voxelSize_));
+        return hashBucket(kx, ky, kz);
+    };
+
+    // 2) Reorder point indices so points in the same bucket are contiguous.
+    std::sort(
+        sortedIndex_.begin(),
+        sortedIndex_.end(),
+        [&](uint32_t a, uint32_t b)
+        {
+            return bucketOf(a) < bucketOf(b);
+        });
+
+    // Helper that extracts a contiguous [begin, end) run sharing one bucket.
+    auto makeNextRun = [&](uint32_t &cursor) -> BucketRun
+    {
+        BucketRun run{};
+        run.bucket = bucketOf(sortedIndex_[cursor]);
+        run.begin = cursor;
+        while (cursor < n && bucketOf(sortedIndex_[cursor]) == run.bucket)
+            ++cursor;
+        run.end = cursor;
+        run.count = run.end - run.begin;
+        run.kept = run.count;
+        if (limitHeavyBuckets_ && maxPtsPerBucket_ > 0)
+            run.kept = std::min<uint32_t>(run.count, static_cast<uint32_t>(maxPtsPerBucket_));
+        return run;
+    };
+
+    // Generic host-visible upload helper.
+    auto uploadBytes = [&](VkDeviceMemory mem, const void *src, size_t bytes)
+    {
+        void *mapped = nullptr;
+        vkMapMemory(ctx_.device, mem, 0, VK_WHOLE_SIZE, 0, &mapped);
+        if (bytes > 0)
+            std::memcpy(mapped, src, bytes);
+        vkUnmapMemory(ctx_.device, mem);
+    };
+
+    // 3) Build packed point array and bucket ranges [cellStart, cellEnd).
+    std::vector<VH_Point> sortedPts;
+    sortedPts.reserve(n);
+
+    uint32_t cursor = 0;
+    uint32_t activeBuckets = 0;
+    while (cursor < n)
+    {
+        const BucketRun run = makeNextRun(cursor);
+
+        droppedPoints_ += (run.count - run.kept);
+        maxPtsInBucket_ = std::max(maxPtsInBucket_, run.kept);
+        if (run.kept > 0)
+            ++activeBuckets;
+
+        cellStart_[run.bucket] = static_cast<uint32_t>(sortedPts.size());
+        for (uint32_t i = 0; i < run.kept; ++i)
+            sortedPts.push_back(cpuPts_[sortedIndex_[run.begin + i]]);
+        cellEnd_[run.bucket] = static_cast<uint32_t>(sortedPts.size());
+    }
+
+    if (activeBuckets > 0)
+        avgPtsInActiveBucket_ = static_cast<float>(sortedPts.size()) / static_cast<float>(activeBuckets);
+
+    // 4) Upload packed points and bucket ranges to GPU buffers.
+    ptCount_ = static_cast<uint32_t>(sortedPts.size());
+    {
+        void *mapped = nullptr;
+        vkMapMemory(ctx_.device, ptMem_, 0, VK_WHOLE_SIZE, 0, &mapped);
+        std::memset(mapped, 0, sizeof(float) * 4 * VH_BATCH_SIZE);
+        if (!sortedPts.empty())
+            std::memcpy(mapped, sortedPts.data(), sizeof(VH_Point) * sortedPts.size());
+        vkUnmapMemory(ctx_.device, ptMem_);
+    }
+    uploadBytes(cellStartMem_, cellStart_.data(), sizeof(uint32_t) * cellStart_.size());
+    uploadBytes(cellEndMem_, cellEnd_.data(), sizeof(uint32_t) * cellEnd_.size());
+
+    auto t1 = std::chrono::steady_clock::now();
+    sortMs_ = std::chrono::duration<float, std::milli>(t1 - t0).count();
+}
+
+void VoxelHashFeature::readPerfQueries()
+{
+    if (perfQueryPool_ == VK_NULL_HANDLE || !hasPerfQueries_)
+        return;
+
+    std::array<uint64_t, 6> t{};
+    VkResult res = vkGetQueryPoolResults(
+        ctx_.device, perfQueryPool_, 0, static_cast<uint32_t>(t.size()),
+        sizeof(t), t.data(), sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (res != VK_SUCCESS)
+        return;
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(ctx_.physicalDevice, &props);
+    const float nsToMs = props.limits.timestampPeriod * 1e-6f;
+    gatherMs_ = static_cast<float>(t[1] - t[0]) * nsToMs;
+    finalizeMs_ = static_cast<float>(t[3] - t[2]) * nsToMs;
+    countMs_ = static_cast<float>(t[5] - t[4]) * nsToMs;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -638,6 +953,17 @@ void VoxelHashFeature::createBuffers()
               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
               ctrBuf_, ctrMem_);
+
+    // 공간 인덱스: CPU 정렬 후 버킷별 범위 [cellStart, cellEnd) 업로드
+    createBuf(sizeof(uint32_t) * VH_NUM_BUCKETS,
+              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+              cellStartBuf_, cellStartMem_);
+
+    createBuf(sizeof(uint32_t) * VH_NUM_BUCKETS,
+              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+              cellEndBuf_, cellEndMem_);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -646,8 +972,8 @@ void VoxelHashFeature::createBuffers()
 
 void VoxelHashFeature::createDescriptors()
 {
-    VkDescriptorSetLayoutBinding b[3]{};
-    for (int i = 0; i < 3; i++)
+    VkDescriptorSetLayoutBinding b[5]{};
+    for (int i = 0; i < 5; i++)
     {
         b[i].binding = static_cast<uint32_t>(i);
         b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -656,12 +982,12 @@ void VoxelHashFeature::createDescriptors()
     }
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 3;
+    lci.bindingCount = 5;
     lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(ctx_.device, &lci, nullptr, &descLayout_) != VK_SUCCESS)
         throw std::runtime_error("VoxelHash: descriptor layout");
 
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = 1;
@@ -681,9 +1007,11 @@ void VoxelHashFeature::createDescriptors()
     VkDescriptorBufferInfo htI{htBuf_, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo ptI{ptBuf_, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo ctrI{ctrBuf_, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[3]{};
-    VkDescriptorBufferInfo *infos[3] = {&htI, &ptI, &ctrI};
-    for (int i = 0; i < 3; i++)
+    VkDescriptorBufferInfo csI{cellStartBuf_, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo ceI{cellEndBuf_, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[5]{};
+    VkDescriptorBufferInfo *infos[5] = {&htI, &ptI, &ctrI, &csI, &ceI};
+    for (int i = 0; i < 5; i++)
     {
         w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet = descSet_;
@@ -692,7 +1020,7 @@ void VoxelHashFeature::createDescriptors()
         w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         w[i].pBufferInfo = infos[i];
     }
-    vkUpdateDescriptorSets(ctx_.device, 3, w, 0, nullptr);
+    vkUpdateDescriptorSets(ctx_.device, 5, w, 0, nullptr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -730,7 +1058,7 @@ void VoxelHashFeature::createComputePipelines()
     };
 
     clearPipe_ = make(kVH_ClearComp);
-    insertPipe_ = make(kVH_InsertComp);
+    gatherPipe_ = make(kVH_GatherComp);
     finalizePipe_ = make(kVH_FinalizeComp);
     countPipe_ = make(kVH_CountComp);
 }
@@ -755,7 +1083,7 @@ void VoxelHashFeature::createRenderPipeline()
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fMod, "main"}};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                                              nullptr, 0, VK_PRIMITIVE_TOPOLOGY_POINT_LIST};
+                                              nullptr, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkViewport vp{0, 0, (float)ctx_.extent.width, (float)ctx_.extent.height, 0, 1};
     VkRect2D sc{{0, 0}, ctx_.extent};
     VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -801,6 +1129,7 @@ void VoxelHashFeature::createRenderPipeline()
     vkDestroyShaderModule(ctx_.device, vMod, nullptr);
 
     // 입력 포인트 클라우드 파이프라인 (같은 frag, 같은 layout, vert만 교체)
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     auto pvMod = compileGLSL(ctx_.device, kVH_PtRenderVert, shaderc_vertex_shader);
     stages[0].module = pvMod;
     if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &pci, nullptr, &ptRenderPipe_) != VK_SUCCESS)
@@ -824,11 +1153,11 @@ void VoxelHashFeature::dispatchClear(VkCommandBuffer cmd)
     vkCmdDispatch(cmd, (VH_TOTAL_ENTRIES + 63) / 64, 1, 1);
 }
 
-void VoxelHashFeature::dispatchInsert(VkCommandBuffer cmd)
+void VoxelHashFeature::dispatchGather(VkCommandBuffer cmd)
 {
     if (ptCount_ == 0)
         return;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, insertPipe_);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gatherPipe_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compLayout_,
                             0, 1, &descSet_, 0, nullptr);
 
@@ -844,7 +1173,7 @@ void VoxelHashFeature::dispatchInsert(VkCommandBuffer cmd)
     pc.truncation = truncation_;
     pc.maxWeight = maxWeight_;
     vkCmdPushConstants(cmd, compLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(cmd, (ptCount_ + 63) / 64, 1, 1);
+    vkCmdDispatch(cmd, VH_NUM_BUCKETS, 1, 1);
 }
 
 void VoxelHashFeature::dispatchFinalize(VkCommandBuffer cmd)
@@ -882,17 +1211,29 @@ void VoxelHashFeature::dispatchCount(VkCommandBuffer cmd)
 void VoxelHashFeature::onInit(const VulkanContext &ctx)
 {
     ctx_ = ctx;
+    cpuPts_.reserve(VH_BATCH_SIZE);
+    sortedIndex_.reserve(VH_BATCH_SIZE);
+    cellStart_.assign(VH_NUM_BUCKETS, 0u);
+    cellEnd_.assign(VH_NUM_BUCKETS, 0u);
     createBuffers();
     createDescriptors();
     createComputePipelines();
     createRenderPipeline();
+
+    VkQueryPoolCreateInfo qci{};
+    qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qci.queryCount = 6;
+    if (vkCreateQueryPool(ctx_.device, &qci, nullptr, &perfQueryPool_) != VK_SUCCESS)
+        throw std::runtime_error("VoxelHash: perf query pool");
+
     lastTime_ = std::chrono::steady_clock::now();
     doClear_ = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  onCompute
-//  순서: [Clear?] → Insert → barrier → Finalize → barrier → Count
+//  순서: [Clear?] → Gather(P2G) → barrier → Finalize → barrier → Count
 // ─────────────────────────────────────────────────────────────────────────────
 
 void VoxelHashFeature::onCompute(VkCommandBuffer cmd)
@@ -908,6 +1249,7 @@ void VoxelHashFeature::onCompute(VkCommandBuffer cmd)
         vkUnmapMemory(ctx_.device, ctrMem_);
         doCountRead_ = false;
     }
+    readPerfQueries();
 
     if (doClear_)
     {
@@ -920,11 +1262,18 @@ void VoxelHashFeature::onCompute(VkCommandBuffer cmd)
         doClear_ = false;
         occupancy_ = 0;
         totalInserted_ = 0;
+        recoveryRecent_.clear();
+        recoveryCompressed_.clear();
     }
 
     if (streaming_)
     {
         ptCount_ = genSphereBatch();
+        float cx = std::cos(sensorEl_), sx = std::sin(sensorEl_);
+        float cy = std::cos(sensorAz_), sy = std::sin(sensorAz_);
+        Eigen::Vector3f sensorPos(sensorDist_ * cx * sy, sensorDist_ * sx, sensorDist_ * cx * cy);
+        updateRecoveryStorage(sensorPos);
+        buildSpatialHashRanges();
         doInsert_ = true;
         sensorAz_ += sensorSpeed_;
         if (sensorAz_ > 2.f * static_cast<float>(M_PI))
@@ -933,8 +1282,12 @@ void VoxelHashFeature::onCompute(VkCommandBuffer cmd)
 
     if (doInsert_ && ptCount_ > 0)
     {
-        // ① Insert: 점 → 버킷 CAS 배치 + float-CAS 누산
-        dispatchInsert(cmd);
+        vkCmdResetQueryPool(cmd, perfQueryPool_, 0, 6);
+
+        // ① Gather(P2G): 점 → 버킷 단위 협력 누산 (원자 없는 write-back)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, perfQueryPool_, 0);
+        dispatchGather(cmd);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, perfQueryPool_, 1);
         bufBarrier(cmd, htBuf_,
                    VK_ACCESS_SHADER_WRITE_BIT,
                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -942,7 +1295,9 @@ void VoxelHashFeature::onCompute(VkCommandBuffer cmd)
                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
         // ② Finalize: running-average 커밋 + frame_tag 기록
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, perfQueryPool_, 2);
         dispatchFinalize(cmd);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, perfQueryPool_, 3);
         bufBarrier(cmd, htBuf_,
                    VK_ACCESS_SHADER_WRITE_BIT,
                    VK_ACCESS_SHADER_READ_BIT,
@@ -950,7 +1305,10 @@ void VoxelHashFeature::onCompute(VkCommandBuffer cmd)
                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
 
         // ③ Count
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, perfQueryPool_, 4);
         dispatchCount(cmd);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, perfQueryPool_, 5);
+        hasPerfQueries_ = true;
 
         totalInserted_ += ptCount_;
         doInsert_ = false;
@@ -986,10 +1344,11 @@ void VoxelHashFeature::onRender(const RenderContext &ctx)
                        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
 
     // 슬롯 수 만큼 버텍스 발행 — 빈 슬롯은 셰이더에서 NDC 밖으로 클리핑
-    vkCmdDraw(ctx.commandBuffer, VH_TOTAL_ENTRIES, 1, 0, 0);
+    vkCmdDraw(ctx.commandBuffer, VH_TOTAL_ENTRIES * 36, 1, 0, 0);
 
     // 입력 포인트 클라우드 오버레이 (시안색, 현재 배치만)
-    if (showInputPts_ && ptCount_ > 0) {
+    if (showInputPts_ && ptCount_ > 0)
+    {
         vkCmdBindPipeline(ctx.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ptRenderPipe_);
         vkCmdBindDescriptorSets(ctx.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 renderLayout_, 0, 1, &descSet_, 0, nullptr);
@@ -1028,6 +1387,16 @@ void VoxelHashFeature::onImGui()
     ImGui::Text("Occupied    : %d  /  %u  (%.2f%%)", occupancy_, VH_TOTAL_ENTRIES, fillPct);
     ImGui::Text("Total pts   : %lld", static_cast<long long>(totalInserted_));
     ImGui::Text("Throughput  : %.0f pts/s", ptsPerSec_);
+    ImGui::Text("P2G gather  : %.3f ms  | finalize: %.3f ms | count: %.3f ms",
+                gatherMs_, finalizeMs_, countMs_);
+    ImGui::Text("Hash sort   : %.3f ms  | dropped: %u", sortMs_, droppedPoints_);
+    ImGui::Text("Bucket load : max %u  avg(active) %.1f", maxPtsInBucket_, avgPtsInActiveBucket_);
+    ImGui::InputFloat("Baseline P2G (ms)", &baselineP2GMs_, 1.f, 5.f, "%.3f");
+    if (baselineP2GMs_ > 0.0f)
+    {
+        float improv = (baselineP2GMs_ - gatherMs_) / baselineP2GMs_ * 100.0f;
+        ImGui::Text("Gather vs baseline: %+0.1f%%", improv);
+    }
     ImGui::Text("Frame       : %u", frameIndex_);
     ImGui::Separator();
 
@@ -1040,15 +1409,23 @@ void VoxelHashFeature::onImGui()
 
     // ── 색상 모드 ─────────────────────────────────────────────────────────────
     ImGui::Text("Color mode");
-    ImGui::RadioButton("Surface color", &colorMode_, 0); ImGui::SameLine();
-    ImGui::RadioButton("Normal",        &colorMode_, 1); ImGui::SameLine();
-    ImGui::RadioButton("TSDF",          &colorMode_, 2); ImGui::SameLine();
-    ImGui::RadioButton("Weight",        &colorMode_, 3); ImGui::SameLine();
-    ImGui::RadioButton("Recency",       &colorMode_, 4);
-    if (colorMode_ == 4) {
-        ImGui::TextColored(ImVec4(1.0f,0.2f,0.0f,1), "■"); ImGui::SameLine();
-        ImGui::Text("= recent");  ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.0f,0.3f,1.0f,1), "■"); ImGui::SameLine();
+    ImGui::RadioButton("Surface color", &colorMode_, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Normal", &colorMode_, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("TSDF", &colorMode_, 2);
+    ImGui::SameLine();
+    ImGui::RadioButton("Weight", &colorMode_, 3);
+    ImGui::SameLine();
+    ImGui::RadioButton("Recency", &colorMode_, 4);
+    if (colorMode_ == 4)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.0f, 1), "■");
+        ImGui::SameLine();
+        ImGui::Text("= recent");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.0f, 0.3f, 1.0f, 1), "■");
+        ImGui::SameLine();
         ImGui::Text("= old");
     }
 
@@ -1057,11 +1434,14 @@ void VoxelHashFeature::onImGui()
     ImGui::Text("Integration visualization");
     ImGui::SliderInt("Highlight frames", &highlightFrames_, 1, 60,
                      "flash for %d frames");
-    ImGui::TextColored(ImVec4(1, 0.9f, 0.1f, 1), "■"); ImGui::SameLine();
+    ImGui::TextColored(ImVec4(1, 0.9f, 0.1f, 1), "■");
+    ImGui::SameLine();
     ImGui::Text("= voxel updated this batch (size ∝ recency)");
     ImGui::Checkbox("Show input points (cyan)", &showInputPts_);
-    if (showInputPts_) {
-        ImGui::TextColored(ImVec4(0.0f,1.0f,1.0f,1), "●"); ImGui::SameLine();
+    if (showInputPts_)
+    {
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1), "●");
+        ImGui::SameLine();
         ImGui::Text("= current batch  (%u pts)", ptCount_);
     }
     ImGui::Separator();
@@ -1074,6 +1454,13 @@ void VoxelHashFeature::onImGui()
     ImGui::SliderFloat("Sphere r", &sphereRadius_, 0.1f, 3.f, "%.2f");
     ImGui::SliderFloat("Noise", &noiseStddev_, 0.f, 0.05f, "%.4f");
     ImGui::SliderFloat("Speed", &sensorSpeed_, 0.f, 0.1f, "%.3f rad/f");
+    ImGui::Checkbox("Limit heavy buckets", &limitHeavyBuckets_);
+    ImGui::SliderInt("Max pts/bucket", &maxPtsPerBucket_, 32, 2048);
+    ImGui::SliderInt("Recent keep frames", &recoveryRecentKeepFrames_, 1, 120);
+    ImGui::SliderInt("Max recent points", &recoveryMaxRecentPoints_, 10000, 1000000);
+    ImGui::SliderFloat("Compress decay", &recoveryCompressWeightDecay_, 0.90f, 1.0f, "%.3f");
+    ImGui::Text("Recovered recent/compressed: %zu / %zu",
+                recoveryRecent_.size(), recoveryCompressed_.size());
     if (rebuild && streaming_)
         doClear_ = true;
     ImGui::Separator();
@@ -1111,7 +1498,7 @@ void VoxelHashFeature::onImGui()
 void VoxelHashFeature::onCleanup()
 {
     vkDestroyPipeline(ctx_.device, clearPipe_, nullptr);
-    vkDestroyPipeline(ctx_.device, insertPipe_, nullptr);
+    vkDestroyPipeline(ctx_.device, gatherPipe_, nullptr);
     vkDestroyPipeline(ctx_.device, finalizePipe_, nullptr);
     vkDestroyPipeline(ctx_.device, countPipe_, nullptr);
     vkDestroyPipeline(ctx_.device, renderPipe_, nullptr);
@@ -1127,4 +1514,9 @@ void VoxelHashFeature::onCleanup()
     vkFreeMemory(ctx_.device, ptMem_, nullptr);
     vkDestroyBuffer(ctx_.device, ctrBuf_, nullptr);
     vkFreeMemory(ctx_.device, ctrMem_, nullptr);
+    vkDestroyBuffer(ctx_.device, cellStartBuf_, nullptr);
+    vkFreeMemory(ctx_.device, cellStartMem_, nullptr);
+    vkDestroyBuffer(ctx_.device, cellEndBuf_, nullptr);
+    vkFreeMemory(ctx_.device, cellEndMem_, nullptr);
+    vkDestroyQueryPool(ctx_.device, perfQueryPool_, nullptr);
 }
