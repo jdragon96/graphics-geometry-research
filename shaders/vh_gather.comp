@@ -1,0 +1,202 @@
+#version 450
+layout(local_size_x = 32) in;
+
+#define SLOT_SIZE 4
+#define EMPTY     0x7FFFFFFF
+
+// -----------------------------
+// Data Structures
+// -----------------------------
+struct SlotKey {
+    int x, y, z;
+};
+
+struct Accum {
+    float t;
+    float w;
+    int   c;
+    int   n;
+};
+
+// -----------------------------
+// Buffers
+// -----------------------------
+layout(set=0, binding=0) buffer HT { int raw[]; } ht;
+
+layout(set=0, binding=5) readonly buffer SortedPosBuf { vec4 p[]; } sortedPos;
+layout(set=0, binding=6) readonly buffer SortedNrmBuf { vec4 n[]; } sortedNrm;
+layout(set=0, binding=7) readonly buffer SortedColBuf { uint c[]; } sortedCol;
+layout(set=0, binding=10) readonly buffer StartIndexBuf { uint d[]; } startIdx;
+
+// -----------------------------
+// Push constants
+// -----------------------------
+layout(push_constant) uniform PC {
+    float sensorX, sensorY, sensorZ;
+    float voxelSize;
+    uint  numPoints;
+    uint  numBuckets;
+    float truncation;
+    float maxWeight;
+} pc;
+
+// -----------------------------
+// Shared memory
+// -----------------------------
+shared SlotKey sKeys[SLOT_SIZE];
+shared Accum   sAccum[SLOT_SIZE];
+
+shared float sReduceT[32];
+shared float sReduceW[32];
+
+// -----------------------------
+// Utility
+// -----------------------------
+int findSlot(ivec3 key)
+{
+    for (int i = 0; i < SLOT_SIZE; i++) {
+        if (sKeys[i].x == key.x &&
+            sKeys[i].y == key.y &&
+            sKeys[i].z == key.z)
+            return i;
+    }
+    return -1;
+}
+
+void insertSlot(uint bucketIdx, ivec3 key)
+{
+    for (int i = 0; i < SLOT_SIZE; i++) {
+        if (sKeys[i].x == EMPTY) {
+            sKeys[i] = SlotKey(key.x, key.y, key.z);
+
+            int base = int((bucketIdx * SLOT_SIZE + uint(i)) * 12);
+            ht.raw[base + 0] = key.x;
+            ht.raw[base + 1] = key.y;
+            ht.raw[base + 2] = key.z;
+            return;
+        }
+    }
+}
+
+// -----------------------------
+// Reduction
+// -----------------------------
+void reduceSlot(inout float valueT, inout float valueW, out float outT, out float outW, uint tid)
+{
+    sReduceT[tid] = valueT;
+    sReduceW[tid] = valueW;
+    barrier();
+
+    for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+        if (tid < offset) {
+            sReduceT[tid] += sReduceT[tid + offset];
+            sReduceW[tid] += sReduceW[tid + offset];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        outT = sReduceT[0];
+        outW = sReduceW[0];
+    }
+}
+
+// -----------------------------
+// Main
+// -----------------------------
+void main()
+{
+    uint bucket = gl_WorkGroupID.x;
+    uint tid    = gl_LocalInvocationID.x;
+
+    // -------------------------
+    // Load existing slots
+    // -------------------------
+    if (tid < SLOT_SIZE) {
+        int base = int((bucket * SLOT_SIZE + tid) * 12);
+
+        sKeys[tid].x = ht.raw[base + 0];
+        sKeys[tid].y = ht.raw[base + 1];
+        sKeys[tid].z = ht.raw[base + 2];
+
+        sAccum[tid] = Accum(0.0, 0.0, 0, 0);
+    }
+    barrier();
+
+    uint start = startIdx.d[bucket];
+    uint end   = (bucket + 1u < pc.numBuckets)
+               ? startIdx.d[bucket + 1u]
+               : pc.numPoints;
+
+    if (start >= end) return;
+
+    // -------------------------
+    // Slot allocation (thread 0)
+    // -------------------------
+    if (tid == 0u) {
+        for (uint i = start; i < end; i++) {
+            ivec3 key = ivec3(floor(sortedPos.p[i].xyz / pc.voxelSize));
+            if (findSlot(key) < 0) {
+                insertSlot(bucket, key);
+            }
+        }
+    }
+    barrier();
+
+    // -------------------------
+    // Per-thread accumulation
+    // -------------------------
+    vec3 sensor = vec3(pc.sensorX, pc.sensorY, pc.sensorZ);
+
+    Accum local[SLOT_SIZE];
+    for (int i = 0; i < SLOT_SIZE; i++){
+        local[i] = Accum(0.0, 0.0, 0, 0);
+    }
+
+    for (uint i = start + tid; i < end; i += 32u) {
+
+        vec3 pos = sortedPos.p[i].xyz;
+        vec3 nrm = normalize(sortedNrm.n[i].xyz);
+        uint col = sortedCol.c[i];
+
+        ivec3 key = ivec3(floor(pos / pc.voxelSize));
+        int s = findSlot(key);
+        if (s < 0) continue;
+
+        vec3 vc = (vec3(key) + 0.5) * pc.voxelSize;
+
+        float tsdf = clamp(dot(vc - pos, nrm) / pc.truncation, -1.0, 1.0);
+        float w    = max(dot(normalize(sensor - pos), nrm), 0.05);
+
+        local[s].t += tsdf * w;
+        local[s].w += w;
+        local[s].c  = int(col);
+    }
+
+    // -------------------------
+    // Reduction
+    // -------------------------
+    for (int s = 0; s < SLOT_SIZE; s++) {
+
+        float outT, outW;
+        reduceSlot(local[s].t, local[s].w, outT, outW, tid);
+
+        if (tid == 0u) {
+            sAccum[s].t = outT;
+            sAccum[s].w = outW;
+        }
+    }
+    barrier();
+
+    // -------------------------
+    // Write back
+    // -------------------------
+    if (tid < SLOT_SIZE && sAccum[tid].w > 0.0) {
+
+        int base = int((bucket * SLOT_SIZE + tid) * 12);
+
+        ht.raw[base + 7] = floatBitsToInt(sAccum[tid].t);
+        ht.raw[base + 8] = floatBitsToInt(sAccum[tid].w);
+        ht.raw[base + 9] = sAccum[tid].c;
+    }
+}

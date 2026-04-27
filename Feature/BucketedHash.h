@@ -2,9 +2,13 @@
 
 #include "IFeature.h"
 #include "../Utilities.h"
+#include "VoxelHash/Buffer.h"
+#include "VoxelHash/ComputeShader.h"
 #include <vulkan/vulkan.h>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <algorithm>
+#include <numeric>
 #include <vector>
 #include <chrono>
 
@@ -22,6 +26,12 @@ struct alignas(16) BH_Entry {
     int32_t key_z = 0;
     int32_t value = -1;
 };
+
+// ── Input point (position only; w is ignored) ────────────────────────────────
+struct BH_Point { float x, y, z; };
+
+// ── Gather shader push constant ───────────────────────────────────────────────
+struct BH_GatherPC { float voxelSize; uint32_t numBuckets; uint32_t p0, p1; };
 
 // ── Push constants ────────────────────────────────────────────────────────────
 struct BH_ComputePC {           // ≤ 16 bytes, shared by all compute shaders
@@ -52,6 +62,9 @@ public:
     void onImGui  ()                         override;
     void onCleanup()                         override;
 
+    // CPU 포인트 배치를 GPU 해시 테이블에 통합 (gather 알고리즘)
+    void Integrate(const BH_Point *pts, uint32_t count);
+
 private:
     VulkanContext ctx_{};
 
@@ -78,6 +91,19 @@ private:
     // occupancy counter: host-visible
     VkBuffer       ctrBuf_ = VK_NULL_HANDLE;
     VkDeviceMemory ctrMem_ = VK_NULL_HANDLE;
+
+    // cellStart / cellEnd: 버킷별 정렬 포인트 범위 (Buffer RAII)
+    Buffer cellStartBuffer_;
+    Buffer cellEndBuffer_;
+
+    // gather 컴퓨트 셰이더 (ComputeShader RAII)
+    ComputeShader gatherShader_;
+
+    // CPU-side sort 작업 버퍼
+    std::vector<float>    sortedPts_;
+    std::vector<uint32_t> cellStart_;
+    std::vector<uint32_t> cellEnd_;
+    std::vector<uint32_t> sortedIndex_;
 
     // ── Frame flags ───────────────────────────────────────────────────────────
     bool doClear_     = true;
@@ -118,6 +144,9 @@ private:
     void dispatchClear (VkCommandBuffer cmd);
     void dispatchInsert(VkCommandBuffer cmd);
     void dispatchCount (VkCommandBuffer cmd);
+
+    void buildSortedRanges(const BH_Point *pts, uint32_t count);
+    void initGatherShader();
 
     void bufBarrier(VkCommandBuffer cmd, VkBuffer buf,
                     VkAccessFlags src, VkAccessFlags dst,

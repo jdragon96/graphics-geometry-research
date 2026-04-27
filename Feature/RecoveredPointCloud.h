@@ -1,14 +1,15 @@
 #pragma once
 
 #include "IFeature.h"
-#include "VoxelHash.h"
+#include "VoxelHash/VoxelHash.h"
 #include "../Utilities.h"
 #include <vulkan/vulkan.h>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <vector>
 
-struct RPC_RenderPoint {
+struct RPC_RenderPoint
+{
     float x = 0.f;
     float y = 0.f;
     float z = 0.f;
@@ -19,7 +20,8 @@ struct RPC_RenderPoint {
     uint32_t _pad = 0u;
 };
 
-class RecoveredPointCloudFeature : public IFeature {
+class RecoveredPointCloudFeature : public IFeature
+{
 public:
     explicit RecoveredPointCloudFeature(const VoxelHashFeature *source) : source_(source) {}
     const char *name() const override { return "Recovered Point Cloud"; }
@@ -47,7 +49,7 @@ private:
     uint32_t drawCount_ = 0;
     uint32_t latestSourceFrame_ = 0;
 
-    int mode_ = 2; // 0 recent, 1 compressed, 2 hybrid
+    int mode_ = 2;      // 0 recent, 1 compressed, 2 hybrid
     int colorMode_ = 0; // 0 sourceColor, 1 normalHint, 2 ageConfidence
     float pointSize_ = 3.0f;
     float confidenceThreshold_ = 0.0f;
@@ -68,4 +70,3 @@ private:
     void rebuildSnapshot();
     static uint32_t packColor(const Eigen::Vector3f &rgb);
 };
-

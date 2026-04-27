@@ -56,6 +56,18 @@ set(SHADERS
     ${SHADER_DIR}/cube_wave.frag
     ${SHADER_DIR}/tsdf_voxel.vert
     ${SHADER_DIR}/tsdf_voxel.frag
+    # ── VoxelHash shaders ──────────────────────────────────────────────────────
+    ${SHADER_DIR}/VoxelHash/VoxelHash_Clear.comp
+    ${SHADER_DIR}/vh_clear.comp
+    ${SHADER_DIR}/vh_histogram.comp
+    ${SHADER_DIR}/vh_prefix_scan.comp
+    ${SHADER_DIR}/vh_scatter.comp
+    ${SHADER_DIR}/vh_gather.comp
+    ${SHADER_DIR}/vh_finalize.comp
+    ${SHADER_DIR}/vh_count.comp
+    ${SHADER_DIR}/vh_render.vert
+    ${SHADER_DIR}/vh_render.frag
+    ${SHADER_DIR}/vh_ptrender.vert
 )
 
 foreach(SHADER ${SHADERS})
@@ -105,8 +117,16 @@ add_executable(vision3d
     Feature/ComputeTest.cpp
     Feature/TSDF.cpp
     Feature/BucketedHash.cpp
-    Feature/VoxelHash.cpp
-    Feature/RecoveredPointCloud.cpp
+    # ── VoxelHash (새 서브폴더 구조) ───────────────────────────────────────────
+    Feature/VoxelHash/ComputeShader.cpp
+    Feature/VoxelHash/VoxelHash.cpp
+    Feature/VoxelHash/VoxelHashBuffers.cpp
+    Feature/VoxelHash/VoxelHashPipelines.cpp
+    Feature/VoxelHash/VoxelHashSort.cpp
+    Feature/VoxelHash/VoxelHashDispatch.cpp
+    Feature/VoxelHash/VoxelHashSynth.cpp
+    Feature/VoxelHash/VoxelHashImGui.cpp
+    # Feature/RecoveredPointCloud.cpp  # 구 VoxelHash API 의존 → 신규 설계에서 제거
     ${IMGUI_SOURCES}
 )
 target_include_directories(vision3d PRIVATE ${COMMON_INCLUDES})

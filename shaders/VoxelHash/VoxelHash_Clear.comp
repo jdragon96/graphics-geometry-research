@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Constants {
+    uint numberOfEntries;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+} constants;
+
+layout(set=0, binding=0) buffer HashTable { int raw[]; } hashTable;
+
+#define STRIDE 12
+#define EMPTY  0x7FFFFFFF
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= constants.numberOfEntries) return;
+
+    int base = int(idx) * STRIDE;
+    hashTable.raw[base +  0] = EMPTY;  // key_x
+    hashTable.raw[base +  1] = 0;      // key_y
+    hashTable.raw[base +  2] = 0;      // key_z
+    hashTable.raw[base +  3] = 0;      // tsdf
+    hashTable.raw[base +  4] = 0;      // weight
+    hashTable.raw[base +  5] = 0;      // color_rgba
+    hashTable.raw[base +  6] = 0;      // normal_oct
+    hashTable.raw[base +  7] = 0;      // acc_tsdf
+    hashTable.raw[base +  8] = 0;      // acc_w
+    hashTable.raw[base +  9] = 0;      // acc_color
+    hashTable.raw[base + 10] = 0;      // acc_norm
+    hashTable.raw[base + 11] = -1;     // frame_tag (-1 = 미관측)
+}

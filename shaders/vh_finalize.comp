@@ -1,0 +1,122 @@
+#version 450
+layout(local_size_x = 64) in;
+
+// -----------------------------
+// Constants
+// -----------------------------
+#define STRIDE  12
+#define EMPTY   0x7FFFFFFF
+
+// Field indices
+#define F_KX     0
+#define F_TSDF   3
+#define F_W      4
+#define F_COL    5
+#define F_NORM   6
+#define F_ACCT   7
+#define F_ACCW   8
+#define F_ACCC   9
+#define F_ACCN  10
+#define F_FTAG  11
+
+// -----------------------------
+// Push constants
+// -----------------------------
+layout(push_constant) uniform PC {
+    uint  totalEntries;
+    uint  currentFrame;
+    float _pad0, _pad1;
+} pc;
+
+// -----------------------------
+// Buffers
+// -----------------------------
+layout(set=0, binding=0) buffer HT {
+    int raw[];
+} ht;
+
+// -----------------------------
+// Utility
+// -----------------------------
+bool isEmpty(int base)
+{
+    return ht.raw[base + F_KX] == EMPTY;
+}
+
+float loadFloat(int base, int field)
+{
+    return intBitsToFloat(ht.raw[base + field]);
+}
+
+void storeFloat(int base, int field, float v)
+{
+    ht.raw[base + field] = floatBitsToInt(v);
+}
+
+void clearAccum(int base)
+{
+    ht.raw[base + F_ACCT] = 0;
+    ht.raw[base + F_ACCW] = 0;
+    ht.raw[base + F_ACCC] = 0;
+    ht.raw[base + F_ACCN] = 0;
+}
+
+// -----------------------------
+// Main
+// -----------------------------
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.totalEntries) return;
+
+    int base = int(idx * uint(STRIDE));
+
+    // -------------------------
+    // Skip invalid voxel
+    // -------------------------
+    if (isEmpty(base)) return;
+
+    // -------------------------
+    // Load accumulated values
+    // -------------------------
+    float accWeight = loadFloat(base, F_ACCW);
+    if (accWeight <= 0.0) return;
+
+    float accTSDF = loadFloat(base, F_ACCT);
+
+    // -------------------------
+    // Load previous state
+    // -------------------------
+    float oldWeight = loadFloat(base, F_W);
+    float oldTSDF   = loadFloat(base, F_TSDF);
+
+    // -------------------------
+    // Running weighted average
+    // -------------------------
+    float totalWeight = oldWeight + accWeight;
+
+    float newTSDF = clamp(
+        (oldTSDF * oldWeight + accTSDF) / totalWeight,
+        -1.0, 1.0
+    );
+
+    float newWeight = min(totalWeight, 100.0);
+
+    // -------------------------
+    // Commit results
+    // -------------------------
+    storeFloat(base, F_TSDF, newTSDF);
+    storeFloat(base, F_W,    newWeight);
+
+    // ⚠️ 현재 방식: 마지막 frame 값 overwrite
+    ht.raw[base + F_COL]  = ht.raw[base + F_ACCC];
+    ht.raw[base + F_NORM] = ht.raw[base + F_ACCN];
+
+    // Frame tag (debug / tracking)
+    ht.raw[base + F_FTAG] = int(pc.currentFrame);
+
+    // -------------------------
+    // Reset accumulators
+    // -------------------------
+    clearAccum(base);
+}

@@ -1,0 +1,81 @@
+// vh_prefix_scan.comp — GPU sort Pass 2: 히스토그램 exclusive prefix sum
+//
+// SoA 바인딩: hist(8) / blockSums(9) / cellStart(10)
+//
+// pass=0  각 워크그룹(1024 스레드)이 로컬 블록 exclusive scan
+//         결과: cellStartBuf_[i] = 블록 내 로컬 prefix
+//               blockSumsBuf_[block] = 블록 전체 합
+//
+// pass=1  단일 워크그룹(1024 스레드)이 blockSums 전체 exclusive scan
+//         결과: blockSumsBuf_[b] = 블록 b 앞의 누적 포인트 수
+//
+// pass=2  각 워크그룹이 blockSums[block]를 cellStartBuf_ 원소에 더함
+//         결과: cellStartBuf_[i] = 전역 exclusive prefix (버킷 i의 시작 오프셋)
+#version 450
+layout(local_size_x = 1024) in;
+
+layout(push_constant) uniform PC {
+    uint numBuckets;
+    uint pass;
+    uint _p0, _p1;
+} pc;
+
+layout(set=0, binding= 8) buffer HistBuf   { uint h[]; } hist;
+layout(set=0, binding= 9) buffer BlockSums { uint s[]; } blockSums;
+layout(set=0, binding=10) buffer BucketStartIndexOfPoints { uint d[]; } bucketStartIndexOfPoints;
+
+shared uint lmem[1024];
+
+void koggeStone() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint s = 1u; s < 1024u; s <<= 1u) {
+        uint v = (tid >= s) ? lmem[tid - s] : 0u;
+        barrier();
+        lmem[tid] += v;
+        barrier();
+    }
+}
+
+/**
+PASS 0
+- Worker Group 내 Point index 정렬
+- GPU 내 Worker Group 별 포인트 개수 계산하기
+
+PASS 1
+// Work group 단위의 포인트 숫자를 계산
+
+PASS 2
+// Work group 단위의 Offset을 Bucket 단위로 전파하기
+*/
+void main() {
+    uint tid   = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint gid   = block * 1024u + tid;
+
+    if (pc.pass == 0u) {
+        lmem[tid] = (gid < pc.numBuckets) ? hist.h[gid] : 0u;
+        barrier();
+        koggeStone();
+
+        uint numberOfPointsInBlock = lmem[1023u];
+        uint exclusiveSumOfBlocks = (tid > 0u) ? lmem[tid - 1u] : 0u;
+        if (gid < pc.numBuckets){
+            bucketStartIndexOfPoints.d[gid] = exclusiveSumOfBlocks;
+        }
+        if (tid == 0u){
+            blockSums.s[block] = numberOfPointsInBlock;
+        }
+    } else if (pc.pass == 1u) {
+        lmem[tid] = blockSums.s[tid];
+        barrier();
+        koggeStone();
+        uint exclusiveSumOfBlocks = (tid > 0u) ? lmem[tid - 1u] : 0u;
+        barrier();
+        blockSums.s[tid] = exclusiveSumOfBlocks;
+    } else {
+        uint offset = blockSums.s[block];
+        if (gid < pc.numBuckets){
+            bucketStartIndexOfPoints.d[gid] += offset;
+        }
+    }
+}

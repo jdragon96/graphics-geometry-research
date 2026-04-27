@@ -1,0 +1,41 @@
+// vh_scatter.comp — GPU sort Pass 3: 포인트를 버킷 순서로 재배치
+//
+// SoA 입력 (unsorted): posBuf_(1), nrmBuf_(2), colBuf_(3)
+// SoA 출력 (sorted):   sortedPosBuf_(5), sortedNrmBuf_(6), sortedColBuf_(7)
+// offset 카운터:        histBuf_(8)  (초기화 후 atomicAdd 재사용)
+// 버킷 시작:            cellStartBuf_(10)
+#version 450
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint  numPoints;
+    uint  numBuckets;
+    float voxelSize;
+    float _pad;
+} pc;
+
+layout(set=0, binding= 1) readonly buffer PosBuf       { vec4 p[]; } inPos;
+layout(set=0, binding= 2) readonly buffer NrmBuf       { vec4 n[]; } inNrm;
+layout(set=0, binding= 3) readonly buffer ColBuf       { uint c[]; } inCol;
+layout(set=0, binding= 5)          buffer SortedPosBuf { vec4 p[]; } sortedPos;
+layout(set=0, binding= 6)          buffer SortedNrmBuf { vec4 n[]; } sortedNrm;
+layout(set=0, binding= 7)          buffer SortedColBuf { uint c[]; } sortedCol;
+layout(set=0, binding= 8)          buffer OffsetBuf    { uint o[]; } offsets;
+layout(set=0, binding=10) readonly buffer StartBuf     { uint d[]; } cellStart;
+
+uint bucketOf(vec3 pos) {
+    ivec3 k = ivec3(floor(pos / pc.voxelSize));
+    return (uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u) % pc.numBuckets;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.numPoints) return;
+
+    uint b    = bucketOf(inPos.p[i].xyz);
+    uint slot = cellStart.d[b] + atomicAdd(offsets.o[b], 1u);
+
+    sortedPos.p[slot] = inPos.p[i];
+    sortedNrm.n[slot] = inNrm.n[i];
+    sortedCol.c[slot] = inCol.c[i];
+}

@@ -7,7 +7,7 @@
 #include <stdexcept>
 
 // GLSL 소스 문자열을 런타임에 SPIR-V로 컴파일하여 VkShaderModule을 반환합니다.
-inline VkShaderModule compileGLSL(VkDevice device, const std::string& src, shaderc_shader_kind kind)
+inline VkShaderModule compileGLSL(VkDevice device, const std::string &src, shaderc_shader_kind kind)
 {
     shaderc::Compiler compiler;
     shaderc::CompileOptions opts;
@@ -20,9 +20,9 @@ inline VkShaderModule compileGLSL(VkDevice device, const std::string& src, shade
     std::vector<uint32_t> spv(result.cbegin(), result.cend());
 
     VkShaderModuleCreateInfo ci{};
-    ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     ci.codeSize = spv.size() * sizeof(uint32_t);
-    ci.pCode    = spv.data();
+    ci.pCode = spv.data();
 
     VkShaderModule mod;
     if (vkCreateShaderModule(device, &ci, nullptr, &mod) != VK_SUCCESS)

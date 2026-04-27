@@ -1,0 +1,31 @@
+// vh_clear.comp — 해시 테이블 전체를 빈 상태로 초기화
+#version 450
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint totalEntries;
+    uint _f, _p0, _p1;
+} pc;
+
+layout(set=0, binding=0) buffer HT { int raw[]; } ht;
+
+#define STRIDE  12
+#define EMPTY   0x7FFFFFFF
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.totalEntries) return;
+    int b = int(i * uint(STRIDE));
+    ht.raw[b+ 0] = EMPTY;  // key_x
+    ht.raw[b+ 1] = 0;      // key_y
+    ht.raw[b+ 2] = 0;      // key_z
+    ht.raw[b+ 3] = 0;      // tsdf
+    ht.raw[b+ 4] = 0;      // weight
+    ht.raw[b+ 5] = 0;      // color_rgba
+    ht.raw[b+ 6] = 0;      // normal_oct
+    ht.raw[b+ 7] = 0;      // acc_tsdf
+    ht.raw[b+ 8] = 0;      // acc_w
+    ht.raw[b+ 9] = 0;      // acc_color
+    ht.raw[b+10] = 0;      // acc_norm
+    ht.raw[b+11] = -1;     // frame_tag (-1 = 미관측)
+}

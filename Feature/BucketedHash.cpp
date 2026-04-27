@@ -4,6 +4,8 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
+#include <numeric>
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Embedded GLSL
@@ -518,6 +520,7 @@ void BucketedHash::onInit(const VulkanContext& ctx)
     createDescriptors();
     createComputePipelines();
     createRenderPipeline();
+    initGatherShader();
     lastTime_ = std::chrono::steady_clock::now();
     doClear_  = true;
 }
@@ -671,11 +674,247 @@ void BucketedHash::onImGui()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Gather shader: 버킷 단위 원자-없는 삽입 (one workgroup = one bucket)
+//  binding 0: hash table, 1: sorted pts (vec4), 3: cellStart, 4: cellEnd
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr const char *kBH_GatherComp = R"GLSL(
+#version 450
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PC {
+    float voxelSize;
+    uint  numBuckets;
+    uint  _p0, _p1;
+} pc;
+
+struct Entry { int kx, ky, kz, val; };
+layout(set=0, binding=0)          buffer HT  { Entry e[];  } ht;
+layout(set=0, binding=1) readonly buffer Pts { vec4  p[];  };
+layout(set=0, binding=3) readonly buffer CS  { uint  d[];  } cellStart;
+layout(set=0, binding=4) readonly buffer CE  { uint  d[];  } cellEnd;
+
+const int BUCKET_SIZE = 4;
+const int EMPTY       = 0x7FFFFFFF;
+
+shared int sKX[BUCKET_SIZE];
+shared int sKY[BUCKET_SIZE];
+shared int sKZ[BUCKET_SIZE];
+
+void main() {
+    uint bucket = gl_WorkGroupID.x;
+    uint tid    = gl_LocalInvocationID.x;
+
+    // Phase 1: 현재 버킷 슬롯의 키를 shared memory에 로드
+    if (tid < uint(BUCKET_SIZE)) {
+        uint slot = bucket * uint(BUCKET_SIZE) + tid;
+        sKX[tid] = ht.e[slot].kx;
+        sKY[tid] = ht.e[slot].ky;
+        sKZ[tid] = ht.e[slot].kz;
+    }
+    barrier();
+
+    uint pStart = cellStart.d[bucket];
+    uint pEnd   = cellEnd.d[bucket];
+    if (pStart >= pEnd) return;
+
+    // Phase 2: thread 0 이 슬롯 할당 (같은 버킷 = workgroup 단독 소유 → 원자 불필요)
+    if (tid == 0u) {
+        for (uint i = pStart; i < pEnd; i++) {
+            ivec3 key = ivec3(floor(Pts.p[i].xyz / pc.voxelSize));
+
+            bool found = false;
+            for (int s = 0; s < BUCKET_SIZE; s++) {
+                if (sKX[s] == key.x && sKY[s] == key.y && sKZ[s] == key.z) {
+                    found = true; break;
+                }
+            }
+            if (found) continue;
+
+            for (int s = 0; s < BUCKET_SIZE; s++) {
+                if (sKX[s] == EMPTY) {
+                    uint slot = bucket * uint(BUCKET_SIZE) + uint(s);
+                    ht.e[slot].kx  = key.x;
+                    ht.e[slot].ky  = key.y;
+                    ht.e[slot].kz  = key.z;
+                    ht.e[slot].val = 0;
+                    sKX[s] = key.x;
+                    sKY[s] = key.y;
+                    sKZ[s] = key.z;
+                    break;
+                }
+            }
+        }
+    }
+}
+)GLSL";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  buildSortedRanges
+//  CPU: 포인트를 버킷 해시 기준으로 정렬하고 cellStart/cellEnd 배열 구성
+// ─────────────────────────────────────────────────────────────────────────────
+
+void BucketedHash::buildSortedRanges(const BH_Point *pts, uint32_t count)
+{
+    auto bucketOf = [&](uint32_t idx) -> uint32_t {
+        auto kx = static_cast<int32_t>(std::floor(pts[idx].x / voxelSize_));
+        auto ky = static_cast<int32_t>(std::floor(pts[idx].y / voxelSize_));
+        auto kz = static_cast<int32_t>(std::floor(pts[idx].z / voxelSize_));
+        uint32_t h = uint32_t(kx) * 73856093u ^ uint32_t(ky) * 19349663u ^ uint32_t(kz) * 83492791u;
+        return h % BH_NUM_BUCKETS;
+    };
+
+    sortedIndex_.resize(count);
+    std::iota(sortedIndex_.begin(), sortedIndex_.end(), 0u);
+    std::sort(sortedIndex_.begin(), sortedIndex_.end(),
+              [&](uint32_t a, uint32_t b) { return bucketOf(a) < bucketOf(b); });
+
+    sortedPts_.clear();
+    sortedPts_.reserve(count * 4);
+    cellStart_.assign(BH_NUM_BUCKETS, 0u);
+    cellEnd_.assign(BH_NUM_BUCKETS, 0u);
+
+    uint32_t cursor = 0;
+    while (cursor < count)
+    {
+        uint32_t bucket = bucketOf(sortedIndex_[cursor]);
+        uint32_t begin  = cursor;
+        while (cursor < count && bucketOf(sortedIndex_[cursor]) == bucket)
+            ++cursor;
+
+        cellStart_[bucket] = static_cast<uint32_t>(sortedPts_.size() / 4);
+        for (uint32_t i = begin; i < cursor; ++i)
+        {
+            const BH_Point &p = pts[sortedIndex_[i]];
+            sortedPts_.push_back(p.x);
+            sortedPts_.push_back(p.y);
+            sortedPts_.push_back(p.z);
+            sortedPts_.push_back(1.f);
+        }
+        cellEnd_[bucket] = static_cast<uint32_t>(sortedPts_.size() / 4);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  initGatherShader
+//  cellStart/cellEnd Buffer 생성 + ComputeShader 초기화
+// ─────────────────────────────────────────────────────────────────────────────
+
+void BucketedHash::initGatherShader()
+{
+    constexpr VkDeviceSize sz    = sizeof(uint32_t) * BH_NUM_BUCKETS;
+    constexpr auto         HOST  = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    constexpr auto         SSBO  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+    cellStartBuffer_.Initialize(ctx_.physicalDevice, ctx_.device, sz, SSBO, HOST);
+    cellEndBuffer_.Initialize  (ctx_.physicalDevice, ctx_.device, sz, SSBO, HOST);
+
+    gatherShader_.InitializeGLSL(
+        ctx_.device,
+        kBH_GatherComp,
+        shaderc_compute_shader,
+        { {0}, {1}, {3}, {4} },   // binding 0: HT, 1: Pts, 3: cellStart, 4: cellEnd
+        sizeof(BH_GatherPC));
+
+    gatherShader_.BindBuffer(0, htBuf_);
+    gatherShader_.BindBuffer(1, ptBuf_);
+    gatherShader_.BindBuffer(3, cellStartBuffer_.GetBuffer());
+    gatherShader_.BindBuffer(4, cellEndBuffer_.GetBuffer());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Integrate
+//  흐름: CPU sort → 업로드(Buffer::Access) → gather dispatch → count
+// ─────────────────────────────────────────────────────────────────────────────
+
+void BucketedHash::Integrate(const BH_Point *pts, uint32_t count)
+{
+    if (count == 0) return;
+    count = std::min(count, BH_BATCH_SIZE);
+
+    // ── 1. CPU: 버킷 해시 기준 정렬 + cellStart/cellEnd 구성 ────────────────
+    buildSortedRanges(pts, count);
+    ptCount_ = static_cast<uint32_t>(sortedPts_.size() / 4);
+
+    // ── 2. GPU 업로드 ────────────────────────────────────────────────────────
+    // 정렬된 포인트 → ptBuf_ (host-visible raw buffer)
+    {
+        void *mapped = nullptr;
+        vkMapMemory(ctx_.device, ptMem_, 0, VK_WHOLE_SIZE, 0, &mapped);
+        std::memcpy(mapped, sortedPts_.data(), sizeof(float) * sortedPts_.size());
+        vkUnmapMemory(ctx_.device, ptMem_);
+    }
+
+    // cellStart/cellEnd → Buffer::Access<uint32_t> RAII 패턴
+    {
+        auto csMap = cellStartBuffer_.Access<uint32_t>(sizeof(uint32_t) * BH_NUM_BUCKETS);
+        std::memcpy(csMap.get(), cellStart_.data(), sizeof(uint32_t) * BH_NUM_BUCKETS);
+    }
+    {
+        auto ceMap = cellEndBuffer_.Access<uint32_t>(sizeof(uint32_t) * BH_NUM_BUCKETS);
+        std::memcpy(ceMap.get(), cellEnd_.data(), sizeof(uint32_t) * BH_NUM_BUCKETS);
+    }
+
+    // ── 3. One-shot command buffer로 GPU 디스패치 ────────────────────────────
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool        = ctx_.commandPool;
+    ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(ctx_.device, &ai, &cmd);
+
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    // Gather: 버킷별 원자-없는 삽입 (one workgroup per bucket)
+    gatherShader_.Bind(cmd);
+    gatherShader_.Push(cmd, BH_GatherPC{voxelSize_, BH_NUM_BUCKETS, 0, 0});
+    gatherShader_.Dispatch(cmd, BH_NUM_BUCKETS);
+
+    // Barrier: gather write → count read
+    bufBarrier(cmd, htBuf_,
+               VK_ACCESS_SHADER_WRITE_BIT,
+               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    // Count: 기존 파이프라인 재사용 (descSet_ 전환 → 자동으로 Ctr binding 복원)
+    dispatchCount(cmd);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cmd;
+    vkQueueSubmit(ctx_.graphicsQueue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(ctx_.graphicsQueue);
+    vkFreeCommandBuffers(ctx_.device, ctx_.commandPool, 1, &cmd);
+
+    // ── 4. 점유율 즉시 읽기 ─────────────────────────────────────────────────
+    void *mapped = nullptr;
+    vkMapMemory(ctx_.device, ctrMem_, 0, sizeof(uint32_t), 0, &mapped);
+    occupancy_ = static_cast<int>(*static_cast<uint32_t *>(mapped));
+    vkUnmapMemory(ctx_.device, ctrMem_);
+
+    totalInserted_ += count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  onCleanup
 // ─────────────────────────────────────────────────────────────────────────────
 
 void BucketedHash::onCleanup()
 {
+    gatherShader_.Clear();
+    cellStartBuffer_.Clear();
+    cellEndBuffer_.Clear();
+
     vkDestroyPipeline      (ctx_.device, clearPipe_,   nullptr);
     vkDestroyPipeline      (ctx_.device, insertPipe_,  nullptr);
     vkDestroyPipeline      (ctx_.device, countPipe_,   nullptr);

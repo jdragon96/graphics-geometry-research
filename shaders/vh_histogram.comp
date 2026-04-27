@@ -1,0 +1,29 @@
+// vh_histogram.comp — GPU sort Pass 1: 버킷별 포인트 수 계산
+//
+// SoA 레이아웃: 위치만 필요하므로 posBuf_(binding=1)만 읽음
+// 결과: histBuf_(binding=8)[bucket] += 포인트 수
+#version 450
+layout(local_size_x = 64) in;
+
+// push_constant: 
+layout(push_constant) uniform PC {
+    uint  numPoints;
+    uint  numBuckets;
+    float voxelSize;
+    float _pad;
+} pc;
+
+layout(set=0, binding=1) readonly buffer PosBuf  { vec4 p[]; } posBuf;
+layout(set=0, binding=8)          buffer HistBuf { uint h[]; } hist;
+
+uint GetIndexOfBucket(vec3 pos) {
+    ivec3 k = ivec3(floor(pos / pc.voxelSize));
+    return (uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u)
+           % pc.numBuckets;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.numPoints) return;
+    atomicAdd(hist.h[GetIndexOfBucket(posBuf.p[i].xyz)], 1u);
+}
