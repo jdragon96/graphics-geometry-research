@@ -58,6 +58,17 @@ set(SHADERS
     ${SHADER_DIR}/tsdf_voxel.frag
     # ── VoxelHash shaders ──────────────────────────────────────────────────────
     ${SHADER_DIR}/VoxelHash/VoxelHash_Clear.comp
+    ${SHADER_DIR}/VoxelHash/VoxelHash_RenderPoint.vert
+    ${SHADER_DIR}/VoxelHash/VoxelHash_RenderPointBySample.vert
+    ${SHADER_DIR}/VoxelHash/VoxelHash_RenderPoint.frag
+    ${SHADER_DIR}/VoxelHash/VoxelHash_RenderVoxel.vert
+    ${SHADER_DIR}/VoxelHash/VoxelHash_RenderVoxel.frag
+    ${SHADER_DIR}/VoxelHash/VoxelHash_UpdateHistogram.comp
+    ${SHADER_DIR}/VoxelHash/VoxelHash_UpdateBucket.comp
+    ${SHADER_DIR}/VoxelHash/VoxelHash_ReallocatePoint.comp
+    ${SHADER_DIR}/VoxelHash/VoxelHash_UpdateTSDF.comp
+    ${SHADER_DIR}/VoxelHash/VoxelHash_UpdateHashTable.comp
+    ${SHADER_DIR}/VoxelHash/VoxelHash_CheckOccupiedVoxel.comp
     ${SHADER_DIR}/vh_clear.comp
     ${SHADER_DIR}/vh_histogram.comp
     ${SHADER_DIR}/vh_prefix_scan.comp
@@ -118,7 +129,10 @@ add_executable(vision3d
     Feature/TSDF.cpp
     Feature/BucketedHash.cpp
     # ── VoxelHash (새 서브폴더 구조) ───────────────────────────────────────────
+    Feature/VoxelHash/Buffer.cpp
     Feature/VoxelHash/ComputeShader.cpp
+    Feature/VoxelHash/RenderingShader.cpp
+    Feature/VoxelHash/BucketVoxelHash.cpp
     Feature/VoxelHash/VoxelHash.cpp
     Feature/VoxelHash/VoxelHashBuffers.cpp
     Feature/VoxelHash/VoxelHashPipelines.cpp

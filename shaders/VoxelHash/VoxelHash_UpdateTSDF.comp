@@ -1,0 +1,210 @@
+#version 450
+layout(local_size_x = 32) in;
+
+const uint WORKGROUP_SIZE = 32;
+const uint BUCKET_SIZE    = 4;
+const uint STRIDE         = 12;
+const int  EMPTY_KEY      = 0x7FFFFFFF;
+
+const int F_KX   = 0;
+const int F_KY   = 1;
+const int F_KZ   = 2;
+const int F_ACCT = 7;
+const int F_ACCW = 8;
+const int F_ACCC = 9;
+const int F_ACCN = 10;
+
+layout(push_constant) uniform PC {
+    vec3  sensorPos;
+    float voxelSize;
+    uint  numPoints;
+    uint  numBuckets;
+    float truncation;
+    float maxWeight;
+} pc;
+
+layout(set=0, binding=0)  buffer HashTable { int raw[]; } ht;
+layout(set=0, binding=5)  readonly buffer SortedPoints { vec4 pts[]; } sortedPts;
+layout(set=0, binding=8)  readonly buffer Histogram    { uint h[];   } hist;
+layout(set=0, binding=10) readonly buffer CellStart    { uint d[];   } cellStart;
+
+shared ivec3 sKeys[BUCKET_SIZE];
+
+shared float sReduceT[WORKGROUP_SIZE];
+shared float sReduceW[WORKGROUP_SIZE];
+
+shared float sFinalT[BUCKET_SIZE];
+shared float sFinalW[BUCKET_SIZE];
+shared int   sColor [BUCKET_SIZE];
+shared int   sNormal[BUCKET_SIZE];
+
+// ----------------- util -----------------
+
+int getBaseIndex(uint bucket, uint slot) {
+    return int((bucket * BUCKET_SIZE + slot) * STRIDE);
+}
+
+ivec3 loadKey(uint bucket, uint slot) {
+    int base = getBaseIndex(bucket, slot);
+    return ivec3(ht.raw[base + F_KX],
+                 ht.raw[base + F_KY],
+                 ht.raw[base + F_KZ]);
+}
+
+void storeKey(uint bucket, uint slot, ivec3 key) {
+    int base = getBaseIndex(bucket, slot);
+    ht.raw[base + F_KX] = key.x;
+    ht.raw[base + F_KY] = key.y;
+    ht.raw[base + F_KZ] = key.z;
+}
+
+int findSlot(ivec3 key) {
+    for (int i = 0; i < int(BUCKET_SIZE); i++) {
+        if (all(equal(sKeys[i], key))) return i;
+    }
+    return -1;
+}
+
+int findEmptySlot() {
+    for (int i = 0; i < int(BUCKET_SIZE); i++) {
+        if (sKeys[i].x == EMPTY_KEY) return i;
+    }
+    return -1;
+}
+
+// ----------------- packing -----------------
+
+uint packNormal(vec3 n) {
+    float l = abs(n.x)+abs(n.y)+abs(n.z);
+    n /= max(l, 1e-6);
+
+    if (n.z < 0.0) {
+        vec2 s = sign(n.xy);
+        n.xy = (1.0 - abs(n.yx)) * s;
+    }
+
+    uint x = uint(clamp(n.x * 0.5 + 0.5, 0., 1.) * 65535.);
+    uint y = uint(clamp(n.y * 0.5 + 0.5, 0., 1.) * 65535.);
+    return (x & 0xFFFFu) | (y << 16u);
+}
+
+uint posCol(ivec3 k) {
+    uint h = uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u;
+    float t = float(h & 0xFFFFu) / 65535.;
+
+    return uint(clamp(abs(fract(t      )*6.-3.)-1.,0.,1.)*255.)
+         | (uint(clamp(abs(fract(t+.333)*6.-3.)-1.,0.,1.)*255.) << 8u)
+         | (uint(clamp(abs(fract(t+.667)*6.-3.)-1.,0.,1.)*255.) << 16u)
+         | 0xFF000000u;
+}
+
+// ----------------- reduction -----------------
+
+void reduceSlot(uint slot, float valT, float valW, uint tid) {
+    sReduceT[tid] = valT;
+    sReduceW[tid] = valW;
+    barrier();
+
+    for (uint stride = WORKGROUP_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sReduceT[tid] += sReduceT[tid + stride];
+            sReduceW[tid] += sReduceW[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        sFinalT[slot] = sReduceT[0];
+        sFinalW[slot] = sReduceW[0];
+    }
+}
+
+// ----------------- main -----------------
+
+void main() {
+    uint bucket = gl_WorkGroupID.x;
+    uint tid    = gl_LocalInvocationID.x;
+
+    // Phase 1
+    if (tid < BUCKET_SIZE) {
+        sKeys[tid]   = loadKey(bucket, tid);
+        sFinalT[tid] = 0.0;
+        sFinalW[tid] = 0.0;
+        sColor[tid]  = 0;
+        sNormal[tid] = 0;
+    }
+    barrier();
+
+    uint start = cellStart.d[bucket];
+    uint end   = start + hist.h[bucket];
+    if (start >= end) return;
+
+    // Phase 2
+    if (tid == 0u) {
+        for (uint i = start; i < end; i++) {
+            ivec3 key = ivec3(floor(sortedPts.pts[i].xyz / pc.voxelSize));
+
+            if (findSlot(key) >= 0) continue;
+
+            int empty = findEmptySlot();
+            if (empty >= 0) {
+                storeKey(bucket, uint(empty), key);
+                sKeys[empty] = key;
+            }
+        }
+    }
+    barrier();
+
+    // Phase 3
+    float localT[BUCKET_SIZE] = float[BUCKET_SIZE](0,0,0,0);
+    float localW[BUCKET_SIZE] = float[BUCKET_SIZE](0,0,0,0);
+    int   localC[BUCKET_SIZE] = int  [BUCKET_SIZE](0,0,0,0);
+    int   localN[BUCKET_SIZE] = int  [BUCKET_SIZE](0,0,0,0);
+
+    for (uint i = start + tid; i < end; i += WORKGROUP_SIZE) {
+        vec3 pt  = sortedPts.pts[i].xyz;
+        ivec3 key = ivec3(floor(pt / pc.voxelSize));
+
+        int slot = findSlot(key);
+        if (slot < 0) continue;
+
+        vec3 sn = normalize(pc.sensorPos - pt);
+        vec3 vc = (vec3(key) + 0.5) * pc.voxelSize;
+
+        float tsdf = clamp(dot(vc - pt, sn) / pc.truncation, -1.0, 1.0);
+        float w    = max(dot(sn, normalize(pc.sensorPos - vc)), 0.05);
+
+        localT[slot] += tsdf * w;
+        localW[slot] += w;
+
+        // 🔥 컬러/노멀 복구
+        localC[slot] = int(posCol(key));
+        localN[slot] = int(packNormal(sn));
+    }
+
+    // Phase 4
+    for (int s = 0; s < int(BUCKET_SIZE); s++) {
+        reduceSlot(s, localT[s], localW[s], tid);
+    }
+
+    // 🔥 대표값 선택 (중요)
+    if (tid == 0u) {
+        for (int s = 0; s < int(BUCKET_SIZE); s++) {
+            if (localC[s] != 0) {
+                sColor[s]  = localC[s];
+                sNormal[s] = localN[s];
+            }
+        }
+    }
+    barrier();
+
+    // Phase 5
+    if (tid < BUCKET_SIZE && sFinalW[tid] > 0.0 && sKeys[tid].x != EMPTY_KEY) {
+        int base = getBaseIndex(bucket, tid);
+
+        ht.raw[base + F_ACCT] = floatBitsToInt(sFinalT[tid]);
+        ht.raw[base + F_ACCW] = floatBitsToInt(sFinalW[tid]);
+        ht.raw[base + F_ACCC] = sColor[tid];
+        ht.raw[base + F_ACCN] = sNormal[tid];
+    }
+}

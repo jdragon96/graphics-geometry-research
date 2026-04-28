@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC {
+    uint  totalEntries;
+    uint  currentFrame;
+    float _p0, _p1;
+} pc;
+
+#define STRIDE  12
+#define F_KX     0
+#define F_TSDF   3
+#define F_W      4
+#define F_COL    5
+#define F_NORM   6
+#define F_ACCT   7
+#define F_ACCW   8
+#define F_ACCC   9
+#define F_ACCN  10
+#define F_FTAG  11
+#define EMPTY   0x7FFFFFFF
+
+layout(set=0, binding=0) buffer HT { int raw[]; } ht;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.totalEntries) return;
+
+    int b = int(i * uint(STRIDE));
+    if (ht.raw[b + F_KX] == EMPTY) return;
+
+    float accW = intBitsToFloat(ht.raw[b + F_ACCW]);
+    if (accW <= 0.0) return;
+
+    float accT = intBitsToFloat(ht.raw[b + F_ACCT]);
+    float oldW = intBitsToFloat(ht.raw[b + F_W]);
+    float oldT = intBitsToFloat(ht.raw[b + F_TSDF]);
+
+    float newW = min(oldW + accW, 50.0);
+    float newT = clamp((oldT * oldW + accT) / (oldW + accW), -1.0, 1.0);
+
+    ht.raw[b + F_TSDF] = floatBitsToInt(newT);
+    ht.raw[b + F_W]    = floatBitsToInt(newW);
+    ht.raw[b + F_COL]  = ht.raw[b + F_ACCC];
+    ht.raw[b + F_NORM] = ht.raw[b + F_ACCN];
+    ht.raw[b + F_FTAG] = int(pc.currentFrame);
+
+    ht.raw[b + F_ACCT] = 0;
+    ht.raw[b + F_ACCW] = 0;
+    ht.raw[b + F_ACCC] = 0;
+    ht.raw[b + F_ACCN] = 0;
+}

@@ -5,18 +5,18 @@ layout(push_constant) uniform Constants {
     uint  numBuckets;
     float voxelSize;
     float _pad;
-} constatns;
+} constants;
 
 layout(set=0, binding=1) readonly buffer PositionBuffer  { vec4 p[]; } position;
-layout(set=0, binding=5)          buffer HistogramBuffer { uint h[]; } histogram;
+layout(set=0, binding=8)          buffer HistogramBuffer { uint h[]; } histogram;
 
 uint GetIndexOfBucket(vec3 pos) {
     ivec3 k = ivec3(floor(pos / constants.voxelSize));
-    return (uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u) % constants.constatns;
+    return (uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u) % constants.numBuckets;
 }
 
 void main() {
     uint indexOfPoint = gl_GlobalInvocationID.x;
-    if (indexOfPoint >= constatns.numPoints) return;
-    atomicAdd(histogram.h[GetIndexOfBucket(position.p[i].xyz)], 1u);
+    if (indexOfPoint >= constants.numPoints) return;
+    atomicAdd(histogram.h[GetIndexOfBucket(position.p[indexOfPoint].xyz)], 1u);
 }

@@ -690,7 +690,7 @@ layout(push_constant) uniform PC {
 
 struct Entry { int kx, ky, kz, val; };
 layout(set=0, binding=0)          buffer HT  { Entry e[];  } ht;
-layout(set=0, binding=1) readonly buffer Pts { vec4  p[];  };
+layout(set=0, binding=1) readonly buffer Pts { vec4  p[];  } pts;
 layout(set=0, binding=3) readonly buffer CS  { uint  d[];  } cellStart;
 layout(set=0, binding=4) readonly buffer CE  { uint  d[];  } cellEnd;
 
@@ -721,7 +721,7 @@ void main() {
     // Phase 2: thread 0 이 슬롯 할당 (같은 버킷 = workgroup 단독 소유 → 원자 불필요)
     if (tid == 0u) {
         for (uint i = pStart; i < pEnd; i++) {
-            ivec3 key = ivec3(floor(Pts.p[i].xyz / pc.voxelSize));
+            ivec3 key = ivec3(floor(pts.p[i].xyz / pc.voxelSize));
 
             bool found = false;
             for (int s = 0; s < BUCKET_SIZE; s++) {
@@ -807,8 +807,8 @@ void BucketedHash::initGatherShader()
                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     constexpr auto         SSBO  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
-    cellStartBuffer_.Initialize(ctx_.physicalDevice, ctx_.device, sz, SSBO, HOST);
-    cellEndBuffer_.Initialize  (ctx_.physicalDevice, ctx_.device, sz, SSBO, HOST);
+    cellStartBuffer_.Initialize(ctx_.physicalDevice, ctx_.device, sz, SSBO, HOST, 0);
+    cellEndBuffer_.Initialize  (ctx_.physicalDevice, ctx_.device, sz, SSBO, HOST, 0);
 
     gatherShader_.InitializeGLSL(
         ctx_.device,

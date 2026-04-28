@@ -5,6 +5,7 @@
 #include "Feature/TSDF.h"
 #include "Feature/BucketedHash.h"
 #include "Feature/VoxelHash/VoxelHash.h"
+#include "Feature/VoxelHash/BucketVoxelHashFeature.h"
 // #include "Feature/RecoveredPointCloud.h"  // 구 VoxelHash API 의존 → 재설계 후 재연결 필요
 
 int main()
@@ -16,6 +17,7 @@ int main()
     app.addFeature(std::make_unique<TSDFFeature>());
     app.addFeature(std::make_unique<BucketedHash>());
     app.addFeature(std::make_unique<VoxelHashFeature>());
+    app.addFeature(std::make_unique<BucketVoxelHashFeature>());
     // RecoveredPointCloudFeature: 구 API(snapshotRecentSamples 등)에 의존 → 신규 VoxelHash에서 제거됨
     app.run();
     return 0;

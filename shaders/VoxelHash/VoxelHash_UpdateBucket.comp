@@ -1,0 +1,62 @@
+#version 450
+
+layout(local_size_x = 1024) in;
+layout(push_constant) uniform Constants {
+    uint numberOfBucket;
+    uint pass;
+    uint padding1;
+    uint padding2;
+} constants;
+
+layout(set=0, binding= 8) buffer Histogram         { uint h[]; } histogram;
+layout(set=0, binding= 9) buffer BlockSummation    { uint b[]; } blockSum;
+layout(set=0, binding=10) buffer StartIndexOfBucket{ uint s[]; } startIndex;
+
+shared uint lmem[1024];
+
+void koggeStone() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint s = 1u; s < 1024u; s <<= 1u) {
+        uint v = (tid >= s) ? lmem[tid - s] : 0u;
+        barrier();
+        lmem[tid] += v;
+        barrier();
+    }
+}
+
+const uint BLOCK_SIZE = 1024u;
+const uint PASS0 = 0u;
+const uint PASS1 = 1u;
+const uint PASS2 = 2u;
+
+void main() {
+    uint tid   = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint gid   = block * BLOCK_SIZE + tid;
+
+    if (constants.pass == PASS0) {
+        lmem[tid] = (gid < constants.numberOfBucket) ? histogram.h[gid] : 0u;
+        barrier();
+        koggeStone();
+
+        if (gid < constants.numberOfBucket) {
+            startIndex.s[gid] = (tid > 0u) ? lmem[tid - 1u] : 0u;
+        }
+        if (tid == 0u) {
+            blockSum.b[block] = lmem[BLOCK_SIZE - 1u];  // 이 블록의 총합
+        }
+    }
+    else if (constants.pass == PASS1) {
+        lmem[tid] = blockSum.b[tid];
+        barrier();
+        koggeStone();
+        barrier();
+        blockSum.b[tid] = (tid > 0u) ? lmem[tid - 1u] : 0u;
+    }
+    else if (constants.pass == PASS2) {
+        uint offset = blockSum.b[block];
+        if (gid < constants.numberOfBucket) {
+            startIndex.s[gid] += offset;
+        }
+    }
+}

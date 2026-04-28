@@ -1,15 +1,17 @@
 #include "Buffer.h"
 #include "../../Utilities.h"
 
-Buffer::~Buffer() { Clear(); }
+Buffer::Buffer() {}
 
 void Buffer::Initialize(
     VkPhysicalDevice physicalDevice, // 핸들은 값으로 전달 가능
     VkDevice device,
     VkDeviceSize bytes,
     VkBufferUsageFlags usage,
-    VkMemoryPropertyFlags props)
+    VkMemoryPropertyFlags props,
+    uint32_t bindingNumber)
 {
+    this->iBindingNumber = bindingNumber;
     this->storedDevice = device; // 해제를 위해 저장
 
     VkBufferCreateInfo bci{};
@@ -49,12 +51,17 @@ void Buffer::Clear()
     memoryInstance = VK_NULL_HANDLE;
 }
 
-template <typename T>
-Buffer::ScopedMemoryGuard<T> Buffer::Access(VkDeviceSize bytes, uint32_t offset, VkMemoryMapFlags flags)
+void Buffer::Barrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
+                     VkPipelineStageFlags srcS, VkPipelineStageFlags dstS)
 {
-    void *mappedPtr = nullptr;
-    if (vkMapMemory(storedDevice, memoryInstance, offset, bytes, flags, &mappedPtr) != VK_SUCCESS)
-        throw std::runtime_error("VoxelHash: vkMapMemory failed");
-
-    return ScopedMemoryGuard<T>(storedDevice, memoryInstance, static_cast<T *>(mappedPtr));
+    VkBufferMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    b.srcAccessMask = src;
+    b.dstAccessMask = dst;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.buffer = bufferInstance;
+    b.offset = 0;
+    b.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 1, &b, 0, nullptr);
 }

@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Constants {
+    uint  numPoints;
+    uint  numBuckets;
+    float voxelSize;
+    float _pad;
+} constants;
+
+layout(set=0, binding= 1) readonly buffer PosBuf       { vec4 p[]; } inPos;
+layout(set=0, binding= 2) readonly buffer NrmBuf       { vec4 n[]; } inNrm;
+layout(set=0, binding= 3) readonly buffer ColBuf       { uint c[]; } inCol;
+layout(set=0, binding= 5)          buffer SortedPosBuf { vec4 p[]; } sortedPos;
+layout(set=0, binding= 6)          buffer SortedNrmBuf { vec4 n[]; } sortedNrm;
+layout(set=0, binding= 7)          buffer SortedColBuf { uint c[]; } sortedCol;
+layout(set=0, binding= 8)          buffer OffsetBuf    { uint o[]; } offsets;
+layout(set=0, binding=10) readonly buffer StartIndexOfBucket { uint s[]; } startIndex;
+
+uint GetIndexOfBucket(vec3 pos) {
+    ivec3 k = ivec3(floor(pos / constants.voxelSize));
+    return (uint(k.x)*73856093u ^ uint(k.y)*19349663u ^ uint(k.z)*83492791u) % constants.numBuckets;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= constants.numPoints) return;
+
+    uint b    = GetIndexOfBucket(inPos.p[gid].xyz);
+    uint slot = startIndex.s[b] + atomicAdd(offsets.o[b], 1u);
+
+    sortedPos.p[slot] = inPos.p[gid];
+    sortedNrm.n[slot] = inNrm.n[gid];
+    sortedCol.c[slot] = inCol.c[gid];
+}

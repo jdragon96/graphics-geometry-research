@@ -48,6 +48,8 @@ public:
     void Dispatch(VkCommandBuffer cmd,
                   uint32_t x, uint32_t y = 1, uint32_t z = 1) const;
 
+    void Barrier();
+
     void Clear();
 
 private:

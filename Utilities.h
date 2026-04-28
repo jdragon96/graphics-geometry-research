@@ -6,6 +6,30 @@
 #include <vector>
 #include <stdexcept>
 
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+#include <vector>
+
+static VkShaderModule loadSpv(VkDevice device, const std::string &path)
+{
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open())
+        throw std::runtime_error("loadSpv: cannot open " + path);
+    auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<uint32_t> buf(size / 4);
+    f.read(reinterpret_cast<char *>(buf.data()), static_cast<std::streamsize>(size));
+    VkShaderModuleCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = size;
+    ci.pCode = buf.data();
+    VkShaderModule mod;
+    if (vkCreateShaderModule(device, &ci, nullptr, &mod) != VK_SUCCESS)
+        throw std::runtime_error("loadSpv: vkCreateShaderModule failed for " + path);
+    return mod;
+}
+
 // GLSL 소스 문자열을 런타임에 SPIR-V로 컴파일하여 VkShaderModule을 반환합니다.
 inline VkShaderModule compileGLSL(VkDevice device, const std::string &src, shaderc_shader_kind kind)
 {
