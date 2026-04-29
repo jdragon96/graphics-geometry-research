@@ -128,6 +128,8 @@ add_executable(vision3d
     Feature/ComputeTest.cpp
     Feature/TSDF.cpp
     Feature/BucketedHash.cpp
+    # ── Acquisition ────────────────────────────────────────────────────────────
+    Feature/Acquisition/SimpleLiDAR.cpp
     # ── VoxelHash (새 서브폴더 구조) ───────────────────────────────────────────
     Feature/VoxelHash/Buffer.cpp
     Feature/VoxelHash/ComputeShader.cpp

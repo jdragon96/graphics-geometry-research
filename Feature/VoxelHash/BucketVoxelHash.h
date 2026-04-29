@@ -33,6 +33,8 @@ public:
 
     void RenderVoxelSlot(VkCommandBuffer cmd, const float *mvp);
 
+    void setVoxelSize(float v) { voxelSize_ = v; }
+
 private:
     void ResetHashTable(VulkanContext &context);
 
