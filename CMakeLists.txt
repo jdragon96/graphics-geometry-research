@@ -60,6 +60,7 @@ set(SHADERS
     ${SHADER_DIR}/VoxelHash/VoxelHash_Clear.comp
     ${SHADER_DIR}/VoxelHash/VoxelHash_RenderPoint.vert
     ${SHADER_DIR}/VoxelHash/VoxelHash_RenderPointBySample.vert
+    ${SHADER_DIR}/VoxelHash/VoxelHash_RenderTSDFPoint.vert
     ${SHADER_DIR}/VoxelHash/VoxelHash_RenderPoint.frag
     ${SHADER_DIR}/VoxelHash/VoxelHash_RenderVoxel.vert
     ${SHADER_DIR}/VoxelHash/VoxelHash_RenderVoxel.frag
@@ -69,6 +70,7 @@ set(SHADERS
     ${SHADER_DIR}/VoxelHash/VoxelHash_UpdateTSDF.comp
     ${SHADER_DIR}/VoxelHash/VoxelHash_UpdateHashTable.comp
     ${SHADER_DIR}/VoxelHash/VoxelHash_CheckOccupiedVoxel.comp
+    ${SHADER_DIR}/VoxelHash/VoxelHash_DeleteBox.comp
     ${SHADER_DIR}/vh_clear.comp
     ${SHADER_DIR}/vh_histogram.comp
     ${SHADER_DIR}/vh_prefix_scan.comp
@@ -123,29 +125,40 @@ add_executable(vision3d
     main.cpp
     Application.cpp
     SceneObject.cpp
-    Feature/TriangleFeature.cpp
-    Feature/BlinnPhongFeature.cpp
-    Feature/ComputeTest.cpp
-    Feature/TSDF.cpp
-    Feature/BucketedHash.cpp
+    # ── Samples ────────────────────────────────────────────────────────────────
+    Feature/Samples/TriangleFeature.cpp
+    Feature/Samples/BlinnPhongFeature.cpp
+    Feature/Samples/ComputeTest.cpp
     # ── Acquisition ────────────────────────────────────────────────────────────
     Feature/Acquisition/SimpleLiDAR.cpp
-    # ── VoxelHash (새 서브폴더 구조) ───────────────────────────────────────────
-    Feature/VoxelHash/Buffer.cpp
-    Feature/VoxelHash/ComputeShader.cpp
-    Feature/VoxelHash/RenderingShader.cpp
-    Feature/VoxelHash/BucketVoxelHash.cpp
-    Feature/VoxelHash/VoxelHash.cpp
-    Feature/VoxelHash/VoxelHashBuffers.cpp
-    Feature/VoxelHash/VoxelHashPipelines.cpp
-    Feature/VoxelHash/VoxelHashSort.cpp
-    Feature/VoxelHash/VoxelHashDispatch.cpp
-    Feature/VoxelHash/VoxelHashSynth.cpp
-    Feature/VoxelHash/VoxelHashImGui.cpp
-    # Feature/RecoveredPointCloud.cpp  # 구 VoxelHash API 의존 → 신규 설계에서 제거
+    # ── Common helpers ─────────────────────────────────────────────────────────
+    Feature/Common/Buffer.cpp
+    Feature/Common/ComputeShader.cpp
+    Feature/Common/RenderingShader.cpp
+    # ── VoxelHash ──────────────────────────────────────────────────────────────
+    Feature/DataStructure/VoxelHash/BucketVoxelHash.cpp
+    Feature/DataStructure/VoxelHash/BucketVoxelHashRender.cpp
+    Feature/DataStructure/VoxelHash/VoxelHash.cpp
+    Feature/DataStructure/VoxelHash/VoxelHashBuffers.cpp
+    Feature/DataStructure/VoxelHash/VoxelHashPipelines.cpp
+    Feature/DataStructure/VoxelHash/VoxelHashSort.cpp
+    Feature/DataStructure/VoxelHash/VoxelHashDispatch.cpp
+    Feature/DataStructure/VoxelHash/VoxelHashSynth.cpp
+    Feature/DataStructure/VoxelHash/VoxelHashImGui.cpp
+    # ── GaussianSplatting ──────────────────────────────────────────────────────
+    Feature/DataStructure/GaussianSplatting/GaussianSplatting.cpp
+    # ── SLAM ───────────────────────────────────────────────────────────────────
+    Feature/SLAM/FastLIO2/FastLIO2.cpp
+    Feature/SLAM/KissICP/KissICP.cpp
+    Feature/SLAM/Viewer/Viewer.cpp
     ${IMGUI_SOURCES}
 )
-target_include_directories(vision3d PRIVATE ${COMMON_INCLUDES})
+target_include_directories(vision3d PRIVATE
+    ${COMMON_INCLUDES}
+    ${CMAKE_SOURCE_DIR}                        # Application.h, SceneObject.h 등
+    ${CMAKE_SOURCE_DIR}/Feature                # "IFeature.h" 직접 참조용 (Samples 등)
+    ${CMAKE_SOURCE_DIR}/Feature/DataStructure  # "../IFeature.h" 등 상대경로 해석용
+)
 target_link_libraries(vision3d PRIVATE ${COMMON_LIBS})
 set_target_properties(vision3d PROPERTIES BUILD_RPATH "${COMMON_RPATH}")
 add_dependencies(vision3d shaders)

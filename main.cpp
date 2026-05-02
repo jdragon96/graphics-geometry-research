@@ -1,12 +1,13 @@
 #include "Application.h"
-#include "Feature/TriangleFeature.h"
-#include "Feature/BlinnPhongFeature.h"
-#include "Feature/ComputeTest.h"
-#include "Feature/TSDF.h"
-#include "Feature/BucketedHash.h"
-#include "Feature/VoxelHash/VoxelHash.h"
-#include "Feature/VoxelHash/BucketVoxelHashFeature.h"
-// #include "Feature/RecoveredPointCloud.h"  // 구 VoxelHash API 의존 → 재설계 후 재연결 필요
+#include "Feature/Samples/TriangleFeature.h"
+#include "Feature/Samples/BlinnPhongFeature.h"
+#include "Feature/Samples/ComputeTest.h"
+#include "Feature/DataStructure/VoxelHash/VoxelHash.h"
+#include "Feature/DataStructure/VoxelHash/BucketVoxelHashFeature.h"
+#include "Feature/DataStructure/GaussianSplatting/GaussianSplatting.h"
+#include "Feature/SLAM/Viewer/ViewerFeature.h"
+#include "Feature/SLAM/FastLIO2/FastLIO2Feature.h"
+#include "Feature/SLAM/KissICP/KissICPFeature.h"
 
 int main()
 {
@@ -14,11 +15,12 @@ int main()
     app.addFeature(std::make_unique<TriangleFeature>());
     app.addFeature(std::make_unique<BlinnPhongFeature>());
     app.addFeature(std::make_unique<ComputeTest>());
-    app.addFeature(std::make_unique<TSDFFeature>());
-    app.addFeature(std::make_unique<BucketedHash>());
     app.addFeature(std::make_unique<VoxelHashFeature>());
     app.addFeature(std::make_unique<BucketVoxelHashFeature>());
-    // RecoveredPointCloudFeature: 구 API(snapshotRecentSamples 등)에 의존 → 신규 VoxelHash에서 제거됨
+    app.addFeature(std::make_unique<GaussianSplattingFeature>());
+    app.addFeature(std::make_unique<KITTIViewerFeature>());
+    app.addFeature(std::make_unique<FastLIO2Feature>());
+    app.addFeature(std::make_unique<KissICPFeature>());
     app.run();
     return 0;
 }

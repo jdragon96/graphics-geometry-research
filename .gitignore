@@ -25,3 +25,6 @@ imgui.ini
 
 */.cache
 **/.cache/
+
+*/dataset
+**/dataset/

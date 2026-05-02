@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../VoxelHash/VoxelHashTypes.h"
+#include "../DataStructure/VoxelHash/VoxelHashTypes.h"
 #include <vector>
 #include <cstdint>
 
@@ -26,6 +26,7 @@ public:
         float    elevMaxDeg    =  15.f; // 최대 앙각 (도)
         float    minRange      = 0.05f; // 최소 감지 거리 (m)
         float    maxRange      = 30.f;  // 최대 감지 거리 (m)
+        float    noiseStddev   = 0.005f; // 위치 노이즈 표준편차 (m)
     };
 
     // ── 씬 구성 ───────────────────────────────────────────────────────────────

@@ -25,6 +25,8 @@ layout(push_constant) uniform PC {
 
 layout(set=0, binding=0)  buffer HashTable { int raw[]; } ht;
 layout(set=0, binding=5)  readonly buffer SortedPoints { vec4 pts[]; } sortedPts;
+layout(set=0, binding=6)  readonly buffer SortedNormals { vec4 nrm[]; } sortedNrm;
+layout(set=0, binding=7)  readonly buffer SortedColors { uint col[]; } sortedCol;
 layout(set=0, binding=8)  readonly buffer Histogram    { uint h[];   } hist;
 layout(set=0, binding=10) readonly buffer CellStart    { uint d[];   } cellStart;
 
@@ -168,18 +170,22 @@ void main() {
         int slot = findSlot(key);
         if (slot < 0) continue;
 
-        vec3 sn = normalize(pc.sensorPos - pt);
+        vec3 n = sortedNrm.nrm[i].xyz;
+        float nLen = length(n);
+        if (nLen > 1e-6) n /= nLen;
+        else             n = normalize(pc.sensorPos - pt);
         vec3 vc = (vec3(key) + 0.5) * pc.voxelSize;
 
-        float tsdf = clamp(dot(vc - pt, sn) / pc.truncation, -1.0, 1.0);
-        float w    = max(dot(sn, normalize(pc.sensorPos - vc)), 0.05);
+        float sdf  = dot(vc - pt, n);
+        float tsdf = clamp(sdf / pc.truncation, -1.0, 1.0);
+        float w    = max(dot(n, normalize(pc.sensorPos - pt)), 0.05);
 
         localT[slot] += tsdf * w;
         localW[slot] += w;
 
-        // 🔥 컬러/노멀 복구
-        localC[slot] = int(posCol(key));
-        localN[slot] = int(packNormal(sn));
+        // 관측된 컬러/법선을 슬롯 대표값으로 보존
+        localC[slot] = int(sortedCol.col[i]);
+        localN[slot] = int(packNormal(n));
     }
 
     // Phase 4

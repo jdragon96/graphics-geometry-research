@@ -1,0 +1,55 @@
+#version 450
+
+// ── VoxelHash_DeleteBox.comp ──────────────────────────────────────────────────
+// Box 범위 내 복셀 항목을 EMPTY 상태로 초기화
+// 용도: FastLIO2 맵 윈도잉 (센서 이동 시 범위 밖 복셀 제거)
+//
+// Push constant: [minK, maxK] 복셀 키 범위 (inclusive)
+// Dispatch: (VH_TOTAL_ENTRIES + 63) / 64  workgroups
+// ─────────────────────────────────────────────────────────────────────────────
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    int minKx, minKy, minKz, _pad0;
+    int maxKx, maxKy, maxKz, _pad1;
+} pc;
+
+layout(set=0, binding=0) buffer HT { int raw[]; } ht;
+
+#define STRIDE  12
+#define EMPTY   0x7FFFFFFF
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // numberOfEntries는 push constant로 받지 않고 상수로 고정
+    // VH_TOTAL_ENTRIES = VH_NUM_BUCKETS(1<<20) * VH_BUCKET_SIZE(4) = 4,194,304
+    if (idx >= 4194304u) return;
+
+    int base = int(idx) * STRIDE;
+    int kx = ht.raw[base + 0];
+    if (kx == EMPTY) return;  // 이미 빈 슬롯 → skip
+
+    int ky = ht.raw[base + 1];
+    int kz = ht.raw[base + 2];
+
+    // 박스 범위 밖이면 skip
+    if (kx < pc.minKx || kx > pc.maxKx) return;
+    if (ky < pc.minKy || ky > pc.maxKy) return;
+    if (kz < pc.minKz || kz > pc.maxKz) return;
+
+    // 범위 내 → Clear (VoxelHash_Clear.comp와 동일한 초기화 패턴)
+    ht.raw[base +  0] = EMPTY;  // key_x (EMPTY 마킹)
+    ht.raw[base +  1] = 0;
+    ht.raw[base +  2] = 0;
+    ht.raw[base +  3] = 0;      // tsdf
+    ht.raw[base +  4] = 0;      // weight
+    ht.raw[base +  5] = 0;      // color_rgba
+    ht.raw[base +  6] = 0;      // normal_oct
+    ht.raw[base +  7] = 0;      // acc_tsdf
+    ht.raw[base +  8] = 0;      // acc_w
+    ht.raw[base +  9] = 0;      // acc_color
+    ht.raw[base + 10] = 0;      // acc_norm
+    ht.raw[base + 11] = -1;     // frame_tag
+}

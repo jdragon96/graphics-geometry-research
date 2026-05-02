@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <random>
 
 static constexpr float kPi = 3.14159265358979f;
 
@@ -141,6 +142,9 @@ std::vector<VH_InputPoint> SimpleLiDAR::scan(float sx, float sy, float sz) const
     std::vector<VH_InputPoint> result;
     result.reserve(cfg_.numRings * cfg_.pointsPerRing);
 
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::normal_distribution<float> noiseDist(0.f, std::max(0.f, cfg_.noiseStddev));
+
     const float toRad = kPi / 180.f;
 
     for (uint32_t r = 0; r < cfg_.numRings; ++r)
@@ -188,9 +192,9 @@ std::vector<VH_InputPoint> SimpleLiDAR::scan(float sx, float sy, float sz) const
             if (!hitAny) continue;
 
             VH_InputPoint pt{};
-            pt.px  = sx + dx * best.t;
-            pt.py  = sy + dy * best.t;
-            pt.pz  = sz + dz * best.t;
+            pt.px  = sx + dx * best.t + noiseDist(rng);
+            pt.py  = sy + dy * best.t + noiseDist(rng);
+            pt.pz  = sz + dz * best.t + noiseDist(rng);
             pt.nx  = best.nx;
             pt.ny  = best.ny;
             pt.nz  = best.nz;
